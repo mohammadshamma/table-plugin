@@ -1,0 +1,24 @@
+{
+  "name": "table-extension",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "MCP extension for JSON-driven SQLite operations",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "server.js",
+    "sqltool.py",
+    "TABLE.md",
+    "gemini-extension.json"
+  ],
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.22.0"
+  }
+}
