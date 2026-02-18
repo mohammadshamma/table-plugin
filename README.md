@@ -1,4 +1,4 @@
-# sqltool — Table Extension
+# Table Extension
 
 A JSON-driven SQLite interface designed for LLM workflows. Create tables, insert rows, join tables, group by with aggregations — all through structured MCP tools.
 
@@ -28,14 +28,14 @@ gemini extensions link .
 
 | Tool | Description |
 |------|-------------|
-| `create_table` | Create a table with typed columns, optional PK & unique constraints |
-| `insert_rows` | Insert rows from a JSON array |
-| `join_tables` | Join two tables into a new table (inner/left/cross) |
-| `group_by` | Group by with aggregations, optionally save to a new table |
-| `run_sql` | Execute arbitrary SQL |
-| `get_schema` | Inspect table columns and types |
-| `list_tables` | List all tables in a database |
-| `drop_table` | Drop a table |
+| `table_create` | Create a table with typed columns, optional PK & unique constraints |
+| `table_insert` | Insert rows from a JSON array |
+| `table_join` | Join two tables into a new table (inner/left/cross) |
+| `table_group_by` | Group by with aggregations, optionally save to a new table |
+| `table_run_sql` | Execute arbitrary SQL |
+| `table_schema` | Inspect table columns and types |
+| `table_list` | List all tables in a database |
+| `table_drop` | Drop a table |
 
 ## Example conversation
 
@@ -49,16 +49,16 @@ gemini extensions link .
 > Group users by age and count them
 ```
 
-The LLM will automatically use the sqltool MCP tools to execute these operations.
+The LLM will automatically use the table MCP tools to execute these operations.
 
 ## Architecture
 
 ```
-LLM CLI ──► MCP Server (server.js) ──► sqltool.py ──► SQLite
+LLM CLI ──► MCP Server (server.js) ──► table_tool.py ──► SQLite
              Node.js + stdio            Python CLI       .db file
 ```
 
-The MCP server translates tool calls into sqltool.py CLI invocations. All data flows as JSON.
+The MCP server translates tool calls into table_tool.py CLI invocations. All data flows as JSON.
 
 ## License
 

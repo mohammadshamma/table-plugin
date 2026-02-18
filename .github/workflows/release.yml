@@ -34,7 +34,7 @@ jobs:
         run: |
           tar -czf table-extension.tar.gz \
             gemini-extension.json \
-            sqltool.py \
+            table_tool.py \
             TABLE.md \
             dist/
 

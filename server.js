@@ -1,7 +1,7 @@
 /**
- * sqltool MCP Server
+ * table MCP Server
  * Exposes SQLite operations as MCP tools.
- * Delegates to sqltool.py for actual database operations.
+ * Delegates to table_tool.py for actual database operations.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 
 const exec = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const SQLTOOL = resolve(__dirname, "sqltool.py");
+const TABLE_TOOL = resolve(__dirname, "table_tool.py");
 
 async function checkPython() {
   try {
@@ -22,42 +22,42 @@ async function checkPython() {
     const major = parseInt(stdout.trim().split(" ")[1], 10);
     if (major < 3) throw new Error("Python 2");
   } catch {
-    console.error("sqltool requires python3 on PATH");
+    console.error("table requires python3 on PATH");
     process.exit(1);
   }
 }
 await checkPython();
 
 /**
- * Run sqltool.py with the given arguments and return parsed JSON.
+ * Run table_tool.py with the given arguments and return parsed JSON.
  */
-async function runSqltool(...args) {
+async function runTableTool(...args) {
   try {
-    const { stdout } = await exec("python3", [SQLTOOL, ...args], {
+    const { stdout } = await exec("python3", [TABLE_TOOL, ...args], {
       timeout: 30000,
       maxBuffer: 10 * 1024 * 1024, // 10MB
     });
     return JSON.parse(stdout);
   } catch (err) {
-    // If sqltool returned JSON error on stdout, parse it
+    // If table_tool returned JSON error on stdout, parse it
     if (err.stdout) {
       try {
         return JSON.parse(err.stdout);
       } catch {}
     }
-    throw new Error(`sqltool failed: ${err.stderr || err.message}`);
+    throw new Error(`table_tool failed: ${err.stderr || err.message}`);
   }
 }
 
 const server = new McpServer({
-  name: "sqltool",
-  version: "0.0.2",
+  name: "table",
+  version: "0.0.3",
 });
 
-// ─── create_table ────────────────────────────────────────────────────────────
+// ─── table_create ───────────────────────────────────────────────────────────
 
 server.registerTool(
-  "create_table",
+  "table_create",
   {
     description:
       "Create a new SQLite table. The database file is created automatically if it doesn't exist.",
@@ -91,15 +91,15 @@ server.registerTool(
     if (unique) spec.unique = unique;
     if (if_not_exists) spec.if_not_exists = if_not_exists;
 
-    const result = await runSqltool("create-table", db, table, JSON.stringify(spec));
+    const result = await runTableTool("create-table", db, table, JSON.stringify(spec));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
-// ─── insert_rows ─────────────────────────────────────────────────────────────
+// ─── table_insert ───────────────────────────────────────────────────────────
 
 server.registerTool(
-  "insert_rows",
+  "table_insert",
   {
     description: "Insert one or more rows into an existing SQLite table.",
     inputSchema: z.object({
@@ -113,15 +113,15 @@ server.registerTool(
     }).shape,
   },
   async ({ db, table, rows }) => {
-    const result = await runSqltool("insert", db, table, JSON.stringify({ rows }));
+    const result = await runTableTool("insert", db, table, JSON.stringify({ rows }));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
-// ─── join_tables ─────────────────────────────────────────────────────────────
+// ─── table_join ─────────────────────────────────────────────────────────────
 
 server.registerTool(
-  "join_tables",
+  "table_join",
   {
     description:
       "Join two SQLite tables and store the result in a new table.",
@@ -154,7 +154,7 @@ server.registerTool(
     }).shape,
   },
   async ({ db, output_table, ...spec }) => {
-    const result = await runSqltool(
+    const result = await runTableTool(
       "join",
       db,
       output_table,
@@ -164,10 +164,10 @@ server.registerTool(
   }
 );
 
-// ─── group_by ────────────────────────────────────────────────────────────────
+// ─── table_group_by ─────────────────────────────────────────────────────────
 
 server.registerTool(
-  "group_by",
+  "table_group_by",
   {
     description:
       "Group rows by one or more columns with aggregation functions. Optionally save results to a new table.",
@@ -193,15 +193,15 @@ server.registerTool(
     }).shape,
   },
   async ({ db, table, ...spec }) => {
-    const result = await runSqltool("group", db, table, JSON.stringify(spec));
+    const result = await runTableTool("group", db, table, JSON.stringify(spec));
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
-// ─── query ───────────────────────────────────────────────────────────────────
+// ─── table_run_sql ──────────────────────────────────────────────────────────
 
 server.registerTool(
-  "run_sql",
+  "table_run_sql",
   {
     description:
       "Run an arbitrary SQL query and return results as JSON. Use for SELECT, UPDATE, DELETE, or any SQL not covered by other tools.",
@@ -211,15 +211,15 @@ server.registerTool(
     }).shape,
   },
   async ({ db, sql }) => {
-    const result = await runSqltool("query", db, sql);
+    const result = await runTableTool("query", db, sql);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
-// ─── schema ──────────────────────────────────────────────────────────────────
+// ─── table_schema ───────────────────────────────────────────────────────────
 
 server.registerTool(
-  "get_schema",
+  "table_schema",
   {
     description:
       "Get the schema of a specific table or all tables in the database.",
@@ -234,15 +234,15 @@ server.registerTool(
   async ({ db, table }) => {
     const args = ["schema", db];
     if (table) args.push(table);
-    const result = await runSqltool(...args);
+    const result = await runTableTool(...args);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
-// ─── list_tables ─────────────────────────────────────────────────────────────
+// ─── table_list ─────────────────────────────────────────────────────────────
 
 server.registerTool(
-  "list_tables",
+  "table_list",
   {
     description: "List all tables in a SQLite database.",
     inputSchema: z.object({
@@ -250,15 +250,15 @@ server.registerTool(
     }).shape,
   },
   async ({ db }) => {
-    const result = await runSqltool("tables", db);
+    const result = await runTableTool("tables", db);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
 
-// ─── drop_table ──────────────────────────────────────────────────────────────
+// ─── table_drop ─────────────────────────────────────────────────────────────
 
 server.registerTool(
-  "drop_table",
+  "table_drop",
   {
     description: "Drop (delete) a table from the database.",
     inputSchema: z.object({
@@ -267,7 +267,7 @@ server.registerTool(
     }).shape,
   },
   async ({ db, table }) => {
-    const result = await runSqltool("drop", db, table);
+    const result = await runTableTool("drop", db, table);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
