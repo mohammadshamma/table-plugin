@@ -51,7 +51,7 @@ async function runSqltool(...args) {
 
 const server = new McpServer({
   name: "sqltool",
-  version: "0.0.1",
+  version: "0.0.2",
 });
 
 // ─── create_table ────────────────────────────────────────────────────────────

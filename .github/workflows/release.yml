@@ -27,15 +27,16 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Build bundle
+        run: npm run build
+
       - name: Create release archive
         run: |
           tar -czf table-extension.tar.gz \
             gemini-extension.json \
-            package.json \
-            server.js \
             sqltool.py \
             TABLE.md \
-            node_modules/
+            dist/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
