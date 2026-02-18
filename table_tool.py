@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-sqltool - A JSON-driven SQLite CLI designed for LLM integration.
+table_tool - A JSON-driven SQLite CLI designed for LLM integration.
 
 Usage:
-    sqltool create-table <db> <table> <json>
-    sqltool insert <db> <table> <json>
-    sqltool join <db> <output_table> <json>
-    sqltool group <db> <table> <json>
-    sqltool query <db> <sql>
-    sqltool schema <db> [<table>]
-    sqltool tables <db>
-    sqltool drop <db> <table>
+    table_tool create-table <db> <table> <json>
+    table_tool insert <db> <table> <json>
+    table_tool join <db> <output_table> <json>
+    table_tool group <db> <table> <json>
+    table_tool query <db> <sql>
+    table_tool schema <db> [<table>]
+    table_tool tables <db>
+    table_tool drop <db> <table>
 
 All data exchange uses JSON for easy LLM generation and parsing.
 Output is always JSON to stdout for easy consumption.
@@ -320,7 +320,7 @@ def cmd_drop(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="sqltool",
+        prog="table_tool",
         description="JSON-driven SQLite CLI for LLM integration",
     )
     sub = parser.add_subparsers(dest="command", required=True)

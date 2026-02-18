@@ -1,6 +1,6 @@
 {
   "name": "table-extension",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "type": "module",
   "description": "MCP extension for JSON-driven SQLite operations",
   "main": "server.js",
@@ -9,13 +9,13 @@
   },
   "files": [
     "server.js",
-    "sqltool.py",
+    "table_tool.py",
     "TABLE.md",
     "gemini-extension.json"
   ],
   "scripts": {
     "start": "node server.js",
-    "build": "esbuild server.js --bundle --platform=node --format=esm --outfile=dist/server.js --external:node:* && cp sqltool.py dist/",
+    "build": "esbuild server.js --bundle --platform=node --format=esm --outfile=dist/server.js --external:node:* && cp table_tool.py dist/",
     "test": "node --test test.js"
   },
   "dependencies": {
