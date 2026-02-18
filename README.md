@@ -1,6 +1,23 @@
-# Table Extension
+# Table Extension for Gemini CLI
 
-A JSON-driven SQLite interface designed for LLM workflows. Create tables, insert rows, join tables, group by with aggregations — all through structured MCP tools.
+A [Gemini CLI](https://github.com/google-gemini/gemini-cli) extension that gives Gemini structured-data superpowers through a JSON-driven SQLite interface.
+
+## Why this exists
+
+LLMs struggle with structured data. Ask one to compare 50 rows across three columns and you'll see numbers transposed, rows dropped, and calculations quietly drift — a problem commonly known as **context rot**. The more data the model juggles inside its context window, the worse it gets.
+
+Table Extension side-steps this by storing data in SQLite, outside the context window. The LLM works with the data through tool calls — creating tables, inserting rows, joining, grouping, and querying — without ever needing to hold raw rows in context. The result is reliable structured-data handling with dramatically less context rot.
+
+### Use subagents for even less context rot
+
+For best results, populate tables inside dedicated **subagents**. When a subagent finishes, its context is discarded, so the main conversation never sees the raw data at all. The main agent can then query the finished tables cleanly, keeping its own context lean and accurate.
+
+A typical workflow looks like this:
+
+1. Main agent creates a table schema.
+2. Main agent delegates to a subagent: *"Read data.csv and insert its rows into the `sales` table."*
+3. Subagent does the heavy lifting (parsing, inserting), then exits.
+4. Main agent queries the populated table — grouping, joining, aggregating — without any raw data ever touching its context.
 
 ## Prerequisites
 
@@ -49,16 +66,16 @@ gemini extensions link .
 > Group users by age and count them
 ```
 
-The LLM will automatically use the table MCP tools to execute these operations.
+Gemini will automatically use the table tools to execute these operations.
 
 ## Architecture
 
 ```
-LLM CLI ──► MCP Server (server.js) ──► table_tool.py ──► SQLite
-             Node.js + stdio            Python CLI       .db file
+Gemini CLI ──► MCP Server (server.js) ──► table_tool.py ──► SQLite
+               Node.js + stdio            Python CLI       .db file
 ```
 
-The MCP server translates tool calls into table_tool.py CLI invocations. All data flows as JSON.
+The MCP server translates tool calls into `table_tool.py` CLI invocations. All data flows as JSON.
 
 ## License
 
