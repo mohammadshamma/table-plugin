@@ -1,5 +1,5 @@
 /**
- * Integration tests for sqltool.py
+ * Integration tests for table_tool.py
  * Uses Node.js built-in test runner (node --test).
  */
 
@@ -13,17 +13,17 @@ import { unlinkSync } from "node:fs";
 
 const exec = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const SQLTOOL = resolve(__dirname, "sqltool.py");
+const TABLE_TOOL = resolve(__dirname, "table_tool.py");
 const DB = resolve(__dirname, "test_temp.db");
 
 async function run(...args) {
-  const { stdout } = await exec("python3", [SQLTOOL, ...args], {
+  const { stdout } = await exec("python3", [TABLE_TOOL, ...args], {
     timeout: 10000,
   });
   return JSON.parse(stdout);
 }
 
-describe("sqltool", () => {
+describe("table_tool", () => {
   after(() => {
     try {
       unlinkSync(DB);

@@ -1,10 +1,10 @@
 {
-  "name": "sqltool",
-  "version": "0.0.2",
+  "name": "table",
+  "version": "0.0.3",
   "description": "JSON-driven SQLite operations for LLM workflows. Create tables, insert rows, join, group by, and run arbitrary SQL.",
   "contextFileName": "TABLE.md",
   "mcpServers": {
-    "sqltool": {
+    "table": {
       "command": "node",
       "args": ["${extensionPath}${/}dist${/}server.js"],
       "cwd": "${extensionPath}"
