@@ -26,28 +26,20 @@ A typical workflow looks like this:
 
 ## Install
 
-### Global installation
-
-Copy the plugin directory into your global Antigravity plugins directory:
+To install the plugin using the Antigravity CLI, build it locally and register it:
 
 ```bash
-mkdir -p ~/.gemini/config/plugins/table
-cp -r . ~/.gemini/config/plugins/table
-```
-
-### Workspace-local installation
-
-Copy the plugin directory into your workspace's `.agents/plugins/` directory:
-
-```bash
-mkdir -p .agents/plugins/table
-cp -r . .agents/plugins/table
-```
-
-Then run:
-```bash
+# 1. Build the plugin
 npm install
 npm run build
+
+# 2. Register via the Antigravity CLI
+agy plugin install .
+```
+
+Alternatively, once published, it can be installed directly from a remote Git repository:
+```bash
+agy plugin install https://github.com/username/table-plugin
 ```
 
 ## Tools

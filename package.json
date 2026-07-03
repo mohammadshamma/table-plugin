@@ -1,5 +1,5 @@
 {
-  "name": "table-extension",
+  "name": "table-plugin",
   "version": "0.0.3",
   "type": "module",
   "description": "Antigravity plugin for database operations",
