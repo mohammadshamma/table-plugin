@@ -26,18 +26,8 @@ A typical workflow looks like this:
 
 ## Install
 
-To install the plugin using the Antigravity CLI, build it locally and register it:
+To install the plugin using the Antigravity CLI:
 
-```bash
-# 1. Build the plugin
-npm install
-npm run build
-
-# 2. Register via the Antigravity CLI
-agy plugin install .
-```
-
-Alternatively, once published, it can be installed directly from a remote Git repository:
 ```bash
 agy plugin install https://github.com/mohammadshamma/table-plugin
 ```
