@@ -2,7 +2,7 @@
   "name": "table-extension",
   "version": "0.0.3",
   "type": "module",
-  "description": "MCP extension for JSON-driven SQLite operations",
+  "description": "Antigravity plugin for database operations",
   "main": "server.js",
   "engines": {
     "node": ">=20"
@@ -10,8 +10,9 @@
   "files": [
     "server.js",
     "table_tool.py",
-    "TABLE.md",
-    "gemini-extension.json"
+    "plugin.json",
+    "mcp_config.json",
+    "skills/"
   ],
   "scripts": {
     "start": "node server.js",

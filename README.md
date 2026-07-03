@@ -1,12 +1,12 @@
-# Table Extension for Gemini CLI
+# Table Plugin for Antigravity
 
-A [Gemini CLI](https://github.com/google-gemini/gemini-cli) extension that gives Gemini structured-data superpowers through a JSON-driven SQLite interface.
+An Antigravity plugin that gives agents database capabilities through structured tools.
 
 ## Why this exists
 
 LLMs struggle with structured data. Ask one to compare 50 rows across three columns and you'll see numbers transposed, rows dropped, and calculations quietly drift — a problem commonly known as **context rot**. The more data the model juggles inside its context window, the worse it gets.
 
-Table Extension side-steps this by storing data in SQLite, outside the context window. The LLM works with the data through tool calls — creating tables, inserting rows, joining, grouping, and querying — without ever needing to hold raw rows in context. The result is reliable structured-data handling with dramatically less context rot.
+This plugin side-steps this by storing data in a database outside the context window. The agent works with the data through tool calls — creating tables, inserting rows, joining, grouping, and querying — without ever needing to hold raw rows in context. The result is reliable structured-data handling with dramatically less context rot.
 
 ### Use subagents for even less context rot
 
@@ -21,24 +21,33 @@ A typical workflow looks like this:
 
 ## Prerequisites
 
-- **Python 3** (sqlite3 is included in the standard library — no extra install needed)
+- **Python 3** (must be available on the system path)
 - **Node.js 20+**
 
 ## Install
 
-### From GitHub
+### Global installation
+
+Copy the plugin directory into your global Antigravity plugins directory:
 
 ```bash
-gemini extensions install https://github.com/mohammadshamma/table-extension
+mkdir -p ~/.gemini/config/plugins/table
+cp -r . ~/.gemini/config/plugins/table
 ```
 
-### Local development
+### Workspace-local installation
+
+Copy the plugin directory into your workspace's `.agents/plugins/` directory:
 
 ```bash
-git clone https://github.com/mohammadshamma/table-extension
-cd table-extension
+mkdir -p .agents/plugins/table
+cp -r . .agents/plugins/table
+```
+
+Then run:
+```bash
 npm install
-gemini extensions link .
+npm run build
 ```
 
 ## Tools
@@ -46,7 +55,7 @@ gemini extensions link .
 | Tool | Description |
 |------|-------------|
 | `table_create` | Create a table with typed columns, optional PK & unique constraints |
-| `table_insert` | Insert rows from a JSON array |
+| `table_insert` | Insert rows from a list |
 | `table_join` | Join two tables into a new table (inner/left/cross) |
 | `table_group_by` | Group by with aggregations, optionally save to a new table |
 | `table_run_sql` | Execute arbitrary SQL |
@@ -66,13 +75,13 @@ gemini extensions link .
 > Group users by age and count them
 ```
 
-Gemini will automatically use the table tools to execute these operations.
+Antigravity agents will automatically use the table tools to execute these operations.
 
 ## Architecture
 
 ```
-Gemini CLI ──► MCP Server (server.js) ──► table_tool.py ──► SQLite
-               Node.js + stdio            Python CLI       .db file
+Antigravity ──► MCP Server (server.js) ──► table_tool.py ──► Database
+                Node.js + stdio            Python CLI       .db file
 ```
 
 The MCP server translates tool calls into `table_tool.py` CLI invocations. All data flows as JSON.
