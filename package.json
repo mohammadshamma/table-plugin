@@ -12,11 +12,12 @@
     "table_tool.py",
     "plugin.json",
     "mcp_config.json",
+    "dist/",
     "skills/"
   ],
   "scripts": {
     "start": "node server.js",
-    "build": "esbuild server.js --bundle --platform=node --format=esm --outfile=dist/server.js --external:node:* && cp table_tool.py dist/",
+    "build": "esbuild server.js --bundle --platform=node --format=esm --outfile=dist/server.mjs --external:node:* && cp table_tool.py dist/",
     "test": "node --test test.js"
   },
   "dependencies": {

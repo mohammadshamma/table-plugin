@@ -1,9 +1,11 @@
 {
   "mcpServers": {
     "table": {
-      "command": "node",
-      "args": ["${extensionPath}/dist/server.js"],
-      "cwd": "${extensionPath}"
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "exec node \"$HOME/.gemini/config/plugins/table/dist/server.mjs\""
+      ]
     }
   }
 }
