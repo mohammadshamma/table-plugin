@@ -1,5 +1,4 @@
 node_modules/
-dist/
 *.db
 .DS_Store
 test_temp.db
