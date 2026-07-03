@@ -39,7 +39,7 @@ agy plugin install .
 
 Alternatively, once published, it can be installed directly from a remote Git repository:
 ```bash
-agy plugin install https://github.com/username/table-plugin
+agy plugin install https://github.com/mohammadshamma/table-plugin
 ```
 
 ## Tools
