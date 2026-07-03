@@ -1,6 +1,6 @@
-node_modules/
 *.db
 .DS_Store
 test_temp.db
+__pycache__/
 .agents/
 .claude/

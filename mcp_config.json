@@ -4,7 +4,7 @@
       "command": "/bin/sh",
       "args": [
         "-c",
-        "exec node \"$HOME/.gemini/config/plugins/table/dist/server.mjs\""
+        "exec uv run \"$HOME/.gemini/config/plugins/table/server.py\""
       ]
     }
   }

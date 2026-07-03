@@ -14,13 +14,19 @@ Usage:
 
 All data exchange uses JSON for easy LLM generation and parsing.
 Output is always JSON to stdout for easy consumption.
+
+The operations are also importable (see op_* functions), which is how
+server.py exposes them as MCP tools without a subprocess round-trip.
 """
 
 import argparse
 import json
 import sqlite3
 import sys
-from pathlib import Path
+
+
+class TableToolError(Exception):
+    """Raised by op_* functions on invalid input or SQLite errors."""
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -51,14 +57,14 @@ def parse_json_arg(raw: str) -> dict:
         error(f"Invalid JSON: {e}")
 
 
-# ─── Commands ────────────────────────────────────────────────────────────────
+# ─── Operations (importable) ─────────────────────────────────────────────────
 
 
-def cmd_create_table(args):
+def op_create_table(db: str, table: str, spec: dict) -> dict:
     """
     Create a table.
 
-    JSON format:
+    Spec format:
     {
         "columns": {
             "name": "TEXT",
@@ -70,10 +76,9 @@ def cmd_create_table(args):
         "if_not_exists": true          // optional, default false
     }
     """
-    spec = parse_json_arg(args.json)
     columns = spec.get("columns")
     if not columns or not isinstance(columns, dict):
-        error("'columns' is required and must be an object mapping column names to types")
+        raise TableToolError("'columns' is required and must be an object mapping column names to types")
 
     col_defs = []
 
@@ -92,24 +97,24 @@ def cmd_create_table(args):
         col_defs.append(f"UNIQUE({ucol})")
 
     exists_clause = "IF NOT EXISTS " if spec.get("if_not_exists") else ""
-    sql = f'CREATE TABLE {exists_clause}"{args.table}" (\n  {",".join(col_defs)}\n)'
+    sql = f'CREATE TABLE {exists_clause}"{table}" (\n  {",".join(col_defs)}\n)'
 
-    conn = connect(args.db)
+    conn = connect(db)
     try:
         conn.execute(sql)
         conn.commit()
-        output({"ok": True, "table": args.table, "sql": sql})
+        return {"ok": True, "table": table, "sql": sql}
     except sqlite3.Error as e:
-        error(f"SQLite error: {e}")
+        raise TableToolError(f"SQLite error: {e}") from e
     finally:
         conn.close()
 
 
-def cmd_insert(args):
+def op_insert(db: str, table: str, spec: dict) -> dict:
     """
     Insert rows into a table.
 
-    JSON format:
+    Spec format:
     {
         "rows": [
             {"name": "Alice", "age": 30, "email": "alice@example.com"},
@@ -117,34 +122,33 @@ def cmd_insert(args):
         ]
     }
     """
-    spec = parse_json_arg(args.json)
     rows = spec.get("rows")
     if not rows or not isinstance(rows, list):
-        error("'rows' is required and must be a list of objects")
+        raise TableToolError("'rows' is required and must be a list of objects")
 
-    conn = connect(args.db)
+    conn = connect(db)
     try:
         inserted = 0
         for row in rows:
             cols = ", ".join(f'"{k}"' for k in row.keys())
             placeholders = ", ".join("?" for _ in row)
-            sql = f'INSERT INTO "{args.table}" ({cols}) VALUES ({placeholders})'
+            sql = f'INSERT INTO "{table}" ({cols}) VALUES ({placeholders})'
             conn.execute(sql, list(row.values()))
             inserted += 1
         conn.commit()
-        output({"ok": True, "table": args.table, "inserted": inserted})
+        return {"ok": True, "table": table, "inserted": inserted}
     except sqlite3.Error as e:
         conn.rollback()
-        error(f"SQLite error: {e}")
+        raise TableToolError(f"SQLite error: {e}") from e
     finally:
         conn.close()
 
 
-def cmd_join(args):
+def op_join(db: str, output_table: str, spec: dict) -> dict:
     """
     Join two tables and store the result in a new table.
 
-    JSON format:
+    Spec format:
     {
         "left": "users",
         "right": "orders",
@@ -155,15 +159,14 @@ def cmd_join(args):
         "if_not_exists": true                    // optional
     }
     """
-    spec = parse_json_arg(args.json)
     left = spec.get("left")
     right = spec.get("right")
     if not left or not right:
-        error("'left' and 'right' table names are required")
+        raise TableToolError("'left' and 'right' table names are required")
 
     join_type = spec.get("type", "inner").upper()
     if join_type not in ("INNER", "LEFT", "CROSS"):
-        error("'type' must be one of: inner, left, cross")
+        raise TableToolError("'type' must be one of: inner, left, cross")
 
     # Build ON clause
     if "on" in spec:
@@ -174,32 +177,32 @@ def cmd_join(args):
         if join_type == "CROSS":
             on_clause = None
         else:
-            error("'on' or both 'on_left'/'on_right' are required (except for cross joins)")
+            raise TableToolError("'on' or both 'on_left'/'on_right' are required (except for cross joins)")
 
     select_cols = ", ".join(spec.get("select", ["*"]))
     exists_clause = "IF NOT EXISTS " if spec.get("if_not_exists") else ""
 
-    sql = f'CREATE TABLE {exists_clause}"{args.output_table}" AS SELECT {select_cols} FROM "{left}" {join_type} JOIN "{right}"'
+    sql = f'CREATE TABLE {exists_clause}"{output_table}" AS SELECT {select_cols} FROM "{left}" {join_type} JOIN "{right}"'
     if on_clause:
         sql += f" ON {on_clause}"
 
-    conn = connect(args.db)
+    conn = connect(db)
     try:
         conn.execute(sql)
         conn.commit()
-        count = conn.execute(f'SELECT COUNT(*) FROM "{args.output_table}"').fetchone()[0]
-        output({"ok": True, "table": args.output_table, "rows": count, "sql": sql})
+        count = conn.execute(f'SELECT COUNT(*) FROM "{output_table}"').fetchone()[0]
+        return {"ok": True, "table": output_table, "rows": count, "sql": sql}
     except sqlite3.Error as e:
-        error(f"SQLite error: {e}")
+        raise TableToolError(f"SQLite error: {e}") from e
     finally:
         conn.close()
 
 
-def cmd_group(args):
+def op_group(db: str, table: str, spec: dict) -> dict:
     """
     Group by columns with aggregations. Returns results as JSON.
 
-    JSON format:
+    Spec format:
     {
         "by": ["department"],
         "aggs": {
@@ -213,20 +216,19 @@ def cmd_group(args):
         "into": "summary_table"          // optional, saves result to new table
     }
     """
-    spec = parse_json_arg(args.json)
     by = spec.get("by")
     aggs = spec.get("aggs")
     if not by or not isinstance(by, list):
-        error("'by' is required and must be a list of column names")
+        raise TableToolError("'by' is required and must be a list of column names")
     if not aggs or not isinstance(aggs, dict):
-        error("'aggs' is required and must be an object mapping alias to aggregate expression")
+        raise TableToolError("'aggs' is required and must be an object mapping alias to aggregate expression")
 
     select_parts = [f'"{col}"' for col in by]
     select_parts += [f'{expr} AS "{alias}"' for alias, expr in aggs.items()]
     select_clause = ", ".join(select_parts)
     group_clause = ", ".join(f'"{col}"' for col in by)
 
-    sql = f'SELECT {select_clause} FROM "{args.table}" GROUP BY {group_clause}'
+    sql = f'SELECT {select_clause} FROM "{table}" GROUP BY {group_clause}'
 
     if "having" in spec:
         sql += f' HAVING {spec["having"]}'
@@ -235,7 +237,7 @@ def cmd_group(args):
     if "limit" in spec:
         sql += f' LIMIT {int(spec["limit"])}'
 
-    conn = connect(args.db)
+    conn = connect(db)
     try:
         # Optionally save to a new table
         into = spec.get("into")
@@ -246,73 +248,115 @@ def cmd_group(args):
 
         rows = conn.execute(sql).fetchall()
         result = [dict(r) for r in rows]
-        out = {"ok": True, "table": args.table, "grouped_by": by, "count": len(result), "rows": result}
+        out = {"ok": True, "table": table, "grouped_by": by, "count": len(result), "rows": result}
         if into:
             out["saved_to"] = into
-        output(out)
+        return out
     except sqlite3.Error as e:
-        error(f"SQLite error: {e}")
+        raise TableToolError(f"SQLite error: {e}") from e
     finally:
         conn.close()
+
+
+def op_query(db: str, sql: str) -> dict:
+    """Run arbitrary SQL and return results as JSON."""
+    conn = connect(db)
+    try:
+        cursor = conn.execute(sql)
+        if cursor.description:
+            rows = [dict(r) for r in cursor.fetchall()]
+            return {"ok": True, "count": len(rows), "rows": rows}
+        else:
+            conn.commit()
+            return {"ok": True, "changes": conn.total_changes}
+    except sqlite3.Error as e:
+        raise TableToolError(f"SQLite error: {e}") from e
+    finally:
+        conn.close()
+
+
+def op_schema(db: str, table: str | None = None) -> dict:
+    """Show schema for a table or all tables."""
+    conn = connect(db)
+    try:
+        if table:
+            rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            columns = {r["name"]: {"type": r["type"], "notnull": bool(r["notnull"]), "pk": bool(r["pk"]), "default": r["dflt_value"]} for r in rows}
+            return {"table": table, "columns": columns}
+        else:
+            tables = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+            return {"tables": {r["name"]: r["sql"] for r in tables}}
+    except sqlite3.Error as e:
+        raise TableToolError(f"SQLite error: {e}") from e
+    finally:
+        conn.close()
+
+
+def op_tables(db: str) -> dict:
+    """List all tables."""
+    conn = connect(db)
+    try:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+        return {"tables": [r["name"] for r in rows]}
+    except sqlite3.Error as e:
+        raise TableToolError(f"SQLite error: {e}") from e
+    finally:
+        conn.close()
+
+
+def op_drop(db: str, table: str) -> dict:
+    """Drop a table."""
+    conn = connect(db)
+    try:
+        conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        conn.commit()
+        return {"ok": True, "dropped": table}
+    except sqlite3.Error as e:
+        raise TableToolError(f"SQLite error: {e}") from e
+    finally:
+        conn.close()
+
+
+# ─── CLI Commands ────────────────────────────────────────────────────────────
+
+
+def run_op(fn, *op_args):
+    try:
+        output(fn(*op_args))
+    except TableToolError as e:
+        error(str(e))
+
+
+def cmd_create_table(args):
+    run_op(op_create_table, args.db, args.table, parse_json_arg(args.json))
+
+
+def cmd_insert(args):
+    run_op(op_insert, args.db, args.table, parse_json_arg(args.json))
+
+
+def cmd_join(args):
+    run_op(op_join, args.db, args.output_table, parse_json_arg(args.json))
+
+
+def cmd_group(args):
+    run_op(op_group, args.db, args.table, parse_json_arg(args.json))
 
 
 def cmd_query(args):
-    """Run arbitrary SQL and return results as JSON."""
-    conn = connect(args.db)
-    try:
-        cursor = conn.execute(args.sql)
-        if cursor.description:
-            rows = [dict(r) for r in cursor.fetchall()]
-            output({"ok": True, "count": len(rows), "rows": rows})
-        else:
-            conn.commit()
-            output({"ok": True, "changes": conn.total_changes})
-    except sqlite3.Error as e:
-        error(f"SQLite error: {e}")
-    finally:
-        conn.close()
+    run_op(op_query, args.db, args.sql)
 
 
 def cmd_schema(args):
-    """Show schema for a table or all tables."""
-    conn = connect(args.db)
-    try:
-        if args.table:
-            rows = conn.execute(f'PRAGMA table_info("{args.table}")').fetchall()
-            columns = {r["name"]: {"type": r["type"], "notnull": bool(r["notnull"]), "pk": bool(r["pk"]), "default": r["dflt_value"]} for r in rows}
-            output({"table": args.table, "columns": columns})
-        else:
-            tables = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
-            output({"tables": {r["name"]: r["sql"] for r in tables}})
-    except sqlite3.Error as e:
-        error(f"SQLite error: {e}")
-    finally:
-        conn.close()
+    run_op(op_schema, args.db, args.table)
 
 
 def cmd_tables(args):
-    """List all tables."""
-    conn = connect(args.db)
-    try:
-        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
-        output({"tables": [r["name"] for r in rows]})
-    except sqlite3.Error as e:
-        error(f"SQLite error: {e}")
-    finally:
-        conn.close()
+    run_op(op_tables, args.db)
 
 
 def cmd_drop(args):
-    """Drop a table."""
-    conn = connect(args.db)
-    try:
-        conn.execute(f'DROP TABLE IF EXISTS "{args.table}"')
-        conn.commit()
-        output({"ok": True, "dropped": args.table})
-    except sqlite3.Error as e:
-        error(f"SQLite error: {e}")
-    finally:
-        conn.close()
+    run_op(op_drop, args.db, args.table)
 
 
 # ─── CLI Setup ───────────────────────────────────────────────────────────────
