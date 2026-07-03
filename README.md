@@ -21,8 +21,11 @@ A typical workflow looks like this:
 
 ## Prerequisites
 
-- **Python 3** (must be available on the system path)
-- **Node.js 20+**
+- **[uv](https://docs.astral.sh/uv/)** — that's it. uv provisions Python and the
+  MCP SDK automatically, so you don't need Python or Node installed.
+
+The first server launch needs network access to download the pinned
+dependencies; uv caches them, so every launch after that is offline and fast.
 
 ## Install
 
@@ -62,26 +65,44 @@ Antigravity agents will automatically use the table tools to execute these opera
 ## Architecture
 
 ```
-Antigravity ──► MCP Server (server.js) ──► table_tool.py ──► Database
-                Node.js + stdio            Python CLI       .db file
+Antigravity ──► MCP Server (server.py) ──► table_tool.py ──► Database
+                Python + stdio (uv run)    imported module   .db file
 ```
 
-The MCP server translates tool calls into `table_tool.py` CLI invocations. All data flows as JSON.
+`server.py` is a single-file [PEP 723](https://peps.python.org/pep-0723/)
+script: `uv run` reads its inline metadata, provisions Python and the pinned
+`mcp` SDK, and starts the server. Tool calls dispatch directly to functions
+imported from `table_tool.py` — no subprocess per call. `table_tool.py` also
+remains usable standalone as a CLI.
+
+## Development
+
+Run the tests (pure stdlib, no dependencies):
+
+```bash
+python3 -m unittest -v
+```
 
 ## Troubleshooting
 
 ### The `table` MCP server fails to start
 
-- **`Cannot find module ... server.mjs`** — the config launches the server from
-  its standard install location, `$HOME/.gemini/config/plugins/table/dist/server.mjs`
-  (hard-coded because Antigravity doesn't substitute variables like
-  `${extensionPath}` and resolves relative paths against the session cwd, not
-  the plugin directory). If your plugin is installed elsewhere, edit
-  `mcp_config.json` inside the plugin directory to point at the absolute path
-  of `dist/server.mjs`.
+- **`uv: command not found`** — the launcher runs `uv` through `/bin/sh`, which
+  may not have your interactive shell's PATH. Either install uv system-wide or
+  edit the installed `mcp_config.json` to use the absolute path of `uv`
+  (usually `$HOME/.local/bin/uv`).
+- **`No such file or directory ... server.py`** — the config launches the
+  server from its standard install location,
+  `$HOME/.gemini/config/plugins/table/server.py` (hard-coded because
+  Antigravity doesn't substitute variables like `${extensionPath}` and
+  resolves relative paths against the session cwd, not the plugin directory).
+  If your plugin is installed elsewhere, edit `mcp_config.json` inside the
+  plugin directory to point at the absolute path of `server.py`.
+- **First launch hangs or fails offline** — the first run downloads the `mcp`
+  SDK; make sure you're online once. Subsequent launches use uv's cache.
 - **Windows** — the `/bin/sh` launcher assumes a POSIX shell. Edit the
-  installed `mcp_config.json` to invoke `node` directly with the absolute path
-  to `dist\server.mjs`.
+  installed `mcp_config.json` to invoke `uv` directly:
+  `{"command": "uv", "args": ["run", "C:\\Users\\<you>\\.gemini\\config\\plugins\\table\\server.py"]}`.
 
 ## License
 
