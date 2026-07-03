@@ -51,7 +51,7 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 ## Example conversation
 
 ```
-> Create a users table in project.db with name, age, and email columns
+> Create a users table with name, age, and email columns
 
 > Insert Alice (30, alice@example.com) and Bob (25, bob@example.com)
 

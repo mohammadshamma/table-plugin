@@ -28,6 +28,13 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 
+import threading
+
+# Thread-safe in-memory cache for conversation_id -> root_conversation_id
+LINEAGE_CACHE = {}
+LINEAGE_CACHE_LOCK = threading.Lock()
+
+
 def get_brain_dir() -> Path:
     """Get the brain directory path where conversation sessions are stored."""
     return Path.home() / ".gemini" / "antigravity" / "brain"
@@ -41,26 +48,24 @@ def find_parent_conversation(child_id: str, brain_dir: Path) -> str | None:
     if not child_id or not brain_dir.is_dir():
         return None
 
-    # Check for word boundary only if boundary character is alphanumeric/underscore
+    # Check for exact UUID boundary (UUIDs consist of hex chars and dashes)
     def matches_boundary(target_id: str, text: str) -> bool:
         escaped = re.escape(target_id)
-        if target_id and (target_id[0].isalnum() or target_id[0] == '_'):
-            start = r'\b'
-        else:
-            start = r'(?<!\w)'
+        pattern = rf"(?<![a-f0-9-])" + escaped + rf"(?![a-f0-9-])"
+        return bool(re.search(pattern, text, re.IGNORECASE))
 
-        if target_id and (target_id[-1].isalnum() or target_id[-1] == '_'):
-            end = r'\b'
-        else:
-            end = r'(?!\w)'
+    # Sort brain_dir subdirectories by modification time (newest first) for determinism
+    try:
+        subdirs = sorted(
+            [d for d in brain_dir.iterdir() if d.is_dir()],
+            key=lambda d: d.stat().st_mtime,
+            reverse=True
+        )
+    except Exception:
+        subdirs = [d for d in brain_dir.iterdir() if d.is_dir()]
 
-        pattern = start + escaped + end
-        return bool(re.search(pattern, text))
-
-    for session_dir in brain_dir.iterdir():
+    for session_dir in subdirs:
         try:
-            if not session_dir.is_dir():
-                continue
             transcript_path = session_dir / ".system_generated" / "logs" / "transcript.jsonl"
             if not transcript_path.is_file():
                 continue
@@ -115,28 +120,88 @@ def find_root_conversation(current_id: str, brain_dir: Path) -> str:
     return curr
 
 
-def get_resolved_db_path() -> str:
+def is_writable(path: Path) -> bool:
+    """Helper to check if a directory is writable for SQLite databases."""
+    import sqlite3
+    test_db = path / ".test_write.db"
+    try:
+        conn = sqlite3.connect(test_db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.close()
+        test_db.unlink(missing_ok=True)
+        # Also clean up WAL files if any
+        Path(str(test_db) + "-wal").unlink(missing_ok=True)
+        Path(str(test_db) + "-shm").unlink(missing_ok=True)
+        return True
+    except Exception:
+        try:
+            test_db.unlink(missing_ok=True)
+            Path(str(test_db) + "-wal").unlink(missing_ok=True)
+            Path(str(test_db) + "-shm").unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def get_resolved_db_path(args: dict) -> str:
     """
-    Resolves the SQLite database path based on environment variables and lineage tracing.
-    If ANTIGRAVITY_CONVERSATION_ID is missing or empty, falls back to session.db in CWD.
+    Resolves the SQLite database path based on the passed conversation_id,
+    falling back to environment variables, and tracing back to the root session.
+    If no ID is available, falls back to a writable scratch directory.
     """
-    conv_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+    conv_id = args.get("conversation_id")
     if not conv_id:
-        return str(Path(os.getcwd()) / "session.db")
+        conv_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+
+    if not conv_id:
+        cwd = Path(os.getcwd())
+        if is_writable(cwd) and cwd != Path("/"):
+            return str(cwd / "session.db")
+        else:
+            # Fallback to a guaranteed writable path in the user's home scratch dir
+            scratch_dir = Path.home() / ".gemini" / "antigravity" / "scratch"
+            try:
+                scratch_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            return str(scratch_dir / "session.db")
 
     brain_dir = get_brain_dir()
-    root_id = find_root_conversation(conv_id, brain_dir)
+
+    # Check cache
+    with LINEAGE_CACHE_LOCK:
+        cached_root = LINEAGE_CACHE.get(conv_id)
+
+    if cached_root:
+        root_id = cached_root
+    else:
+        root_id = find_root_conversation(conv_id, brain_dir)
+        # Cache only positive resolutions (where root is different from the request ID)
+        # to avoid freezing a race-condition first-call miss
+        if root_id and root_id != conv_id:
+            with LINEAGE_CACHE_LOCK:
+                LINEAGE_CACHE[conv_id] = root_id
+
     tables_dir = brain_dir / root_id / ".tables"
     try:
         tables_dir.mkdir(parents=True, exist_ok=True)
+        db_path = tables_dir / "session.db"
     except Exception:
-        pass
+        # Fallback to scratch_dir if mkdir fails
+        scratch_dir = Path.home() / ".gemini" / "antigravity" / "scratch"
+        try:
+            scratch_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        db_path = scratch_dir / "session.db"
 
-    return str(tables_dir / "session.db")
+    return str(db_path)
 
 
 # Schemas are declared verbatim (rather than generated from type hints) to
 # stay byte-identical with the ones the Node server advertised.
+CONV_ID_ARG = {"description": "Optional conversation ID to scope the tables", "type": "string"}
+
 TOOLS = [
     types.Tool(
         name="table_create",
@@ -146,6 +211,7 @@ TOOLS = [
             "additionalProperties": False,
             "type": "object",
             "properties": {
+                "conversation_id": CONV_ID_ARG,
                 "table": {"description": "Name of the table to create", "type": "string"},
                 "columns": {
                     "description": 'Object mapping column names to SQL types, e.g. {"name": "TEXT NOT NULL", "age": "INTEGER"}',
@@ -177,6 +243,7 @@ TOOLS = [
             "additionalProperties": False,
             "type": "object",
             "properties": {
+                "conversation_id": CONV_ID_ARG,
                 "table": {"description": "Table to insert into", "type": "string"},
                 "rows": {
                     "description": 'Array of row objects, e.g. [{"name": "Alice", "age": 30}]',
@@ -195,6 +262,7 @@ TOOLS = [
             "additionalProperties": False,
             "type": "object",
             "properties": {
+                "conversation_id": CONV_ID_ARG,
                 "output_table": {"description": "Name for the new joined table", "type": "string"},
                 "left": {"description": "Left table name", "type": "string"},
                 "right": {"description": "Right table name", "type": "string"},
@@ -233,6 +301,7 @@ TOOLS = [
             "additionalProperties": False,
             "type": "object",
             "properties": {
+                "conversation_id": CONV_ID_ARG,
                 "table": {"description": "Table to group", "type": "string"},
                 "by": {
                     "description": "Columns to group by",
@@ -260,6 +329,7 @@ TOOLS = [
             "additionalProperties": False,
             "type": "object",
             "properties": {
+                "conversation_id": CONV_ID_ARG,
                 "sql": {"description": "SQL statement to execute", "type": "string"},
             },
             "required": ["sql"],
@@ -273,6 +343,7 @@ TOOLS = [
             "additionalProperties": False,
             "type": "object",
             "properties": {
+                "conversation_id": CONV_ID_ARG,
                 "table": {"description": "Table name (omit to get all tables)", "type": "string"},
             },
         },
@@ -284,7 +355,9 @@ TOOLS = [
             "$schema": "http://json-schema.org/draft-07/schema#",
             "additionalProperties": False,
             "type": "object",
-            "properties": {},
+            "properties": {
+                "conversation_id": CONV_ID_ARG,
+            },
         },
     ),
     types.Tool(
@@ -295,6 +368,7 @@ TOOLS = [
             "additionalProperties": False,
             "type": "object",
             "properties": {
+                "conversation_id": CONV_ID_ARG,
                 "table": {"description": "Table to drop", "type": "string"},
             },
             "required": ["table"],
@@ -304,50 +378,40 @@ TOOLS = [
 
 
 def dispatch(name: str, args: dict) -> dict:
-    db_path = get_resolved_db_path()
+    db_path = get_resolved_db_path(args)
 
     if name == "table_create":
-        table_name = args.get("table")
-        if not table_name:
-            raise table_tool.TableToolError("Table name cannot be empty")
         spec = {"columns": args["columns"]}
         for key in ("primary_key", "unique", "if_not_exists"):
             if args.get(key) is not None:
                 spec[key] = args[key]
-        return table_tool.op_create_table(db_path, table_name, spec)
+        return table_tool.op_create_table(db_path, args.get("table"), spec)
 
     elif name == "table_insert":
-        return table_tool.op_insert(db_path, args["table"], {"rows": args["rows"]})
+        return table_tool.op_insert(db_path, args.get("table"), {"rows": args["rows"]})
 
     elif name == "table_join":
-        spec = {k: v for k, v in args.items() if k not in ("output_table",)}
-        return table_tool.op_join(db_path, args["output_table"], spec)
+        spec = {k: v for k, v in args.items() if k not in ("output_table", "conversation_id")}
+        return table_tool.op_join(db_path, args.get("output_table"), spec)
 
     elif name == "table_group_by":
-        limit = args.get("limit")
-        if limit is not None and limit < 0:
-            raise table_tool.TableToolError("Limit must be non-negative")
-        spec = {k: v for k, v in args.items() if k not in ("table",)}
-        return table_tool.op_group(db_path, args["table"], spec)
+        spec = {k: v for k, v in args.items() if k not in ("table", "conversation_id")}
+        return table_tool.op_group(db_path, args.get("table"), spec)
 
     elif name == "table_run_sql":
-        sql = args.get("sql")
-        if not sql or not sql.strip():
-            raise table_tool.TableToolError("SQL query cannot be empty")
-        return table_tool.op_query(db_path, sql)
+        return table_tool.op_query(db_path, args.get("sql"))
 
     elif name == "table_schema":
         table_name = args.get("table")
-        if table_name == "" or (table_name is not None and not isinstance(table_name, str)):
-            return {"columns": {}}
+        if table_name == "":
+            return table_tool.op_schema(db_path, None)
         return table_tool.op_schema(db_path, table_name)
 
     elif name == "table_list":
         return table_tool.op_tables(db_path)
 
     elif name == "table_drop":
-        # Allow empty name to proceed to SQLite drop command
-        return table_tool.op_drop(db_path, args["table"])
+        return table_tool.op_drop(db_path, args.get("table"))
 
     else:
         raise ValueError(f"Unknown tool: {name}")
@@ -365,9 +429,8 @@ async def list_tools() -> list[types.Tool]:
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     try:
         result = dispatch(name, arguments)
-    except Exception as e:
-        # Same behavior as the Node server: errors come back as a
-        # normal JSON payload, not a protocol-level tool error.
+    except table_tool.TableToolError as e:
+        # Expected errors from table_tool operations
         result = {"error": str(e)}
     return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 

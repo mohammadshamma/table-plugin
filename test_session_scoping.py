@@ -815,7 +815,7 @@ class TestSessionScopingTier2(SessionScopingTestBase):
     def test_tc_schema_bnd_01_empty_name(self):
         self.setup_happy_lineage()
         res = self.call_tool_sync("table_schema", {"table": ""})
-        self.assertEqual(res.get("columns"), {})
+        self.assertIn("tables", res)
 
     def test_tc_schema_bnd_02_invalid_type(self):
         self.setup_happy_lineage()
@@ -892,7 +892,7 @@ class TestSessionScopingTier2(SessionScopingTestBase):
     def test_tc_drop_bnd_01_empty_name(self):
         self.setup_happy_lineage()
         res = self.call_tool_sync("table_drop", {"table": ""})
-        self.assertEqual(res.get("ok"), True)
+        self.assertIn("error", res)
 
     def test_tc_drop_bnd_02_sql_injection(self):
         self.setup_happy_lineage()
@@ -1012,8 +1012,15 @@ class TestSessionScopingTier2(SessionScopingTestBase):
         # Make the CWD read-only
         self.cwd_dir.chmod(0o555)
         try:
-            res = self.call_tool_sync("table_create", {"table": "t", "columns": {"x": "INTEGER"}})
-            self.assertIn("error", res)
+            res = self.call_tool_sync("table_create", {
+                "table": "t",
+                "columns": {"x": "INTEGER"},
+                "if_not_exists": True
+            })
+            # Should succeed because of scratch directory fallback
+            self.assertEqual(res.get("ok"), True)
+            expected_db = Path.home() / ".gemini" / "antigravity" / "scratch" / "session.db"
+            self.assertTrue(expected_db.exists())
         finally:
             self.cwd_dir.chmod(0o755)
 
@@ -1321,6 +1328,56 @@ class TestSessionScopingTier4(SessionScopingTestBase):
         # Verify checksum/integrity
         res = self.call_tool_sync("table_run_sql", {"sql": "SELECT val FROM source_t ORDER BY val"})
         self.assertEqual(res.get("rows"), rows_backup)
+
+    # --- Scenario 6: Scoping via Tool Call Argument & Cache & Fallback & Exceptions ---
+    def test_tc_real_06_parameter_scoping(self):
+        self.write_mock_transcript("root-arg-session", "child-arg-session")
+        # Do NOT set os.environ["ANTIGRAVITY_CONVERSATION_ID"]
+        # Pass conversation_id directly in arguments
+        res = self.call_tool_sync("table_create", {
+            "conversation_id": "child-arg-session",
+            "table": "param_table",
+            "columns": {"msg": "TEXT"}
+        })
+        self.assertEqual(res.get("ok"), True)
+        expected_db = self.brain_dir / "root-arg-session" / ".tables" / "session.db"
+        self.assertTrue(expected_db.exists())
+
+    def test_tc_real_07_cache_positive_lineage(self):
+        self.write_mock_transcript("root-cached", "child-cached")
+        # Call 1: Resolves lineage and caches root-cached for child-cached
+        self.call_tool_sync("table_create", {
+            "conversation_id": "child-cached",
+            "table": "t1",
+            "columns": {"x": "INTEGER"}
+        })
+        # Verify that it is in the server's lineage cache
+        with server.LINEAGE_CACHE_LOCK:
+            self.assertEqual(server.LINEAGE_CACHE.get("child-cached"), "root-cached")
+
+    def test_tc_real_08_scratch_fallback(self):
+        if "ANTIGRAVITY_CONVERSATION_ID" in os.environ:
+            del os.environ["ANTIGRAVITY_CONVERSATION_ID"]
+        # Call with no conversation_id or environment variable
+        self.call_tool_sync("table_create", {
+            "table": "scratch_table",
+            "columns": {"x": "INTEGER"}
+        })
+        expected_db = Path.home() / ".gemini" / "antigravity" / "scratch" / "session.db"
+        self.assertTrue(expected_db.exists())
+
+    def test_tc_real_09_mkdir_exception(self):
+        self.write_mock_transcript("root-session", "child-session")
+        # Mock mkdir to raise an exception
+        with patch.object(Path, "mkdir", side_effect=OSError("Permission Denied")):
+            res = self.call_tool_sync("table_create", {
+                "conversation_id": "child-session",
+                "table": "test_t",
+                "columns": {"x": "INTEGER"},
+                "if_not_exists": True
+            })
+            # Should fallback/execute despite directory exception
+            self.assertEqual(res.get("ok"), True)
 
 
 if __name__ == "__main__":
