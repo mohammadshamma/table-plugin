@@ -68,6 +68,21 @@ Antigravity ──► MCP Server (server.js) ──► table_tool.py ──► D
 
 The MCP server translates tool calls into `table_tool.py` CLI invocations. All data flows as JSON.
 
+## Troubleshooting
+
+### The `table` MCP server fails to start
+
+- **`Cannot find module ... server.mjs`** — the config launches the server from
+  its standard install location, `$HOME/.gemini/config/plugins/table/dist/server.mjs`
+  (hard-coded because Antigravity doesn't substitute variables like
+  `${extensionPath}` and resolves relative paths against the session cwd, not
+  the plugin directory). If your plugin is installed elsewhere, edit
+  `mcp_config.json` inside the plugin directory to point at the absolute path
+  of `dist/server.mjs`.
+- **Windows** — the `/bin/sh` launcher assumes a POSIX shell. Edit the
+  installed `mcp_config.json` to invoke `node` directly with the absolute path
+  to `dist\server.mjs`.
+
 ## License
 
 MIT
