@@ -3,3 +3,5 @@ dist/
 *.db
 .DS_Store
 test_temp.db
+.agents/
+.claude/

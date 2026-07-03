@@ -1,0 +1,5 @@
+{
+  "name": "table",
+  "version": "0.0.3",
+  "description": "Database operations for LLM workflows. Create tables, insert rows, join, group by, and run arbitrary SQL."
+}

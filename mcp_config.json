@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "table": {
+      "command": "node",
+      "args": ["${extensionPath}/dist/server.js"],
+      "cwd": "${extensionPath}"
+    }
+  }
+}
