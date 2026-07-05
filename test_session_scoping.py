@@ -37,9 +37,17 @@ class SessionScopingTestBase(unittest.TestCase):
         self.old_cwd = os.getcwd()
         os.chdir(self.cwd_dir)
 
+        # Create a mock scratch directory
+        self.temp_scratch_dir = tempfile.TemporaryDirectory()
+        self.scratch_dir = Path(self.temp_scratch_dir.name).resolve()
+
         # Patch server's get_brain_dir function if it exists, or create it if not
         self.brain_patcher = patch("server.get_brain_dir", return_value=self.brain_dir, create=True)
         self.mock_get_brain_dir = self.brain_patcher.start()
+
+        # Patch server's get_scratch_dir function
+        self.scratch_patcher = patch("server.get_scratch_dir", return_value=self.scratch_dir, create=True)
+        self.mock_get_scratch_dir = self.scratch_patcher.start()
 
         # Default env setup (start with clean env, override in specific tests)
         self.env_patcher = patch.dict(os.environ, {}, clear=True)
@@ -47,6 +55,7 @@ class SessionScopingTestBase(unittest.TestCase):
 
     def tearDown(self):
         self.brain_patcher.stop()
+        self.scratch_patcher.stop()
         self.env_patcher.stop()
         os.chdir(self.old_cwd)
         try:
@@ -55,6 +64,10 @@ class SessionScopingTestBase(unittest.TestCase):
             pass
         try:
             self.temp_cwd_dir.cleanup()
+        except Exception:
+            pass
+        try:
+            self.temp_scratch_dir.cleanup()
         except Exception:
             pass
 
@@ -1019,7 +1032,7 @@ class TestSessionScopingTier2(SessionScopingTestBase):
             })
             # Should succeed because of scratch directory fallback
             self.assertEqual(res.get("ok"), True)
-            expected_db = Path.home() / ".gemini" / "antigravity" / "scratch" / "session.db"
+            expected_db = self.scratch_dir / "session.db"
             self.assertTrue(expected_db.exists())
         finally:
             self.cwd_dir.chmod(0o755)
@@ -1358,13 +1371,20 @@ class TestSessionScopingTier4(SessionScopingTestBase):
     def test_tc_real_08_scratch_fallback(self):
         if "ANTIGRAVITY_CONVERSATION_ID" in os.environ:
             del os.environ["ANTIGRAVITY_CONVERSATION_ID"]
-        # Call with no conversation_id or environment variable
-        self.call_tool_sync("table_create", {
-            "table": "scratch_table",
-            "columns": {"x": "INTEGER"}
-        })
-        expected_db = Path.home() / ".gemini" / "antigravity" / "scratch" / "session.db"
-        self.assertTrue(expected_db.exists())
+        # Make the CWD read-only
+        self.cwd_dir.chmod(0o555)
+        try:
+            # Call with no conversation_id or environment variable
+            res = self.call_tool_sync("table_create", {
+                "table": "scratch_table",
+                "columns": {"x": "INTEGER"},
+                "if_not_exists": True
+            })
+            self.assertEqual(res.get("ok"), True)
+            expected_db = self.scratch_dir / "session.db"
+            self.assertTrue(expected_db.exists())
+        finally:
+            self.cwd_dir.chmod(0o755)
 
     def test_tc_real_09_mkdir_exception(self):
         self.write_mock_transcript("root-session", "child-session")
@@ -1378,6 +1398,17 @@ class TestSessionScopingTier4(SessionScopingTestBase):
             })
             # Should fallback/execute despite directory exception
             self.assertEqual(res.get("ok"), True)
+            expected_db = self.scratch_dir / "session.db"
+            self.assertTrue(expected_db.exists())
+
+    def test_tc_real_10_path_traversal_injection(self):
+        # Passing an unsafe conversation_id should raise a ValueError
+        with self.assertRaises(ValueError):
+            asyncio.run(server.call_tool("table_create", {
+                "conversation_id": "../../../unsafe",
+                "table": "t",
+                "columns": {"x": "INTEGER"}
+            }))
 
 
 if __name__ == "__main__":

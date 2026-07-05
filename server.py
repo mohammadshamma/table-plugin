@@ -40,6 +40,11 @@ def get_brain_dir() -> Path:
     return Path.home() / ".gemini" / "antigravity" / "brain"
 
 
+def get_scratch_dir() -> Path:
+    """Get the scratch directory path."""
+    return Path.home() / ".gemini" / "antigravity" / "scratch"
+
+
 def find_parent_conversation(child_id: str, brain_dir: Path) -> str | None:
     """
     Scans the directories in brain_dir for transcript.jsonl logs.
@@ -153,13 +158,18 @@ def get_resolved_db_path(args: dict) -> str:
     if not conv_id:
         conv_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
 
+    if conv_id:
+        # Validate conversation_id to prevent path traversal / prompt injection
+        if not re.match(r"^[a-zA-Z0-9_-]+$", conv_id):
+            raise ValueError("Invalid conversation_id format")
+
     if not conv_id:
         cwd = Path(os.getcwd())
         if is_writable(cwd) and cwd != Path("/"):
             return str(cwd / "session.db")
         else:
             # Fallback to a guaranteed writable path in the user's home scratch dir
-            scratch_dir = Path.home() / ".gemini" / "antigravity" / "scratch"
+            scratch_dir = get_scratch_dir()
             try:
                 scratch_dir.mkdir(parents=True, exist_ok=True)
             except Exception:
@@ -188,7 +198,7 @@ def get_resolved_db_path(args: dict) -> str:
         db_path = tables_dir / "session.db"
     except Exception:
         # Fallback to scratch_dir if mkdir fails
-        scratch_dir = Path.home() / ".gemini" / "antigravity" / "scratch"
+        scratch_dir = get_scratch_dir()
         try:
             scratch_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
