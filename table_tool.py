@@ -30,11 +30,14 @@ class TableToolError(Exception):
 
 
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+    except sqlite3.Error as e:
+        raise TableToolError(f"SQLite error: {e}") from e
 
 
 def output(data: dict | list) -> None:
@@ -76,6 +79,8 @@ def op_create_table(db: str, table: str, spec: dict) -> dict:
         "if_not_exists": true          // optional, default false
     }
     """
+    if not table or not table.strip():
+        raise TableToolError("Table name cannot be empty")
     columns = spec.get("columns")
     if not columns or not isinstance(columns, dict):
         raise TableToolError("'columns' is required and must be an object mapping column names to types")
@@ -122,6 +127,8 @@ def op_insert(db: str, table: str, spec: dict) -> dict:
         ]
     }
     """
+    if not table or not table.strip():
+        raise TableToolError("Table name cannot be empty")
     rows = spec.get("rows")
     if not rows or not isinstance(rows, list):
         raise TableToolError("'rows' is required and must be a list of objects")
@@ -159,6 +166,8 @@ def op_join(db: str, output_table: str, spec: dict) -> dict:
         "if_not_exists": true                    // optional
     }
     """
+    if not output_table or not output_table.strip():
+        raise TableToolError("Output table name cannot be empty")
     left = spec.get("left")
     right = spec.get("right")
     if not left or not right:
@@ -216,12 +225,18 @@ def op_group(db: str, table: str, spec: dict) -> dict:
         "into": "summary_table"          // optional, saves result to new table
     }
     """
+    if not table or not table.strip():
+        raise TableToolError("Table name cannot be empty")
     by = spec.get("by")
     aggs = spec.get("aggs")
     if not by or not isinstance(by, list):
         raise TableToolError("'by' is required and must be a list of column names")
     if not aggs or not isinstance(aggs, dict):
         raise TableToolError("'aggs' is required and must be an object mapping alias to aggregate expression")
+
+    limit = spec.get("limit")
+    if limit is not None and limit < 0:
+        raise TableToolError("Limit must be non-negative")
 
     select_parts = [f'"{col}"' for col in by]
     select_parts += [f'{expr} AS "{alias}"' for alias, expr in aggs.items()]
@@ -260,6 +275,8 @@ def op_group(db: str, table: str, spec: dict) -> dict:
 
 def op_query(db: str, sql: str) -> dict:
     """Run arbitrary SQL and return results as JSON."""
+    if not sql or not sql.strip():
+        raise TableToolError("SQL query cannot be empty")
     conn = connect(db)
     try:
         cursor = conn.execute(sql)
@@ -306,6 +323,8 @@ def op_tables(db: str) -> dict:
 
 def op_drop(db: str, table: str) -> dict:
     """Drop a table."""
+    if not table or not table.strip():
+        raise TableToolError("Table name cannot be empty")
     conn = connect(db)
     try:
         conn.execute(f'DROP TABLE IF EXISTS "{table}"')

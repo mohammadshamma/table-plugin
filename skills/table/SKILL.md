@@ -20,8 +20,8 @@ You have access to database tools via the `table` MCP server. Use these tools to
 
 ## Usage Notes
 
-- Database files are created automatically on first use — no init step needed.
-- All tools accept a `db` path. Use relative paths for project-local databases (e.g. `./data.db`).
+- Database tables are automatically local to your agent session and all descendants.
+- Always retrieve your current `conversationId` from your User Information/Metadata (e.g. `d6528b8e-...`) and pass it as the `conversation_id` parameter to all tools. This ensures session isolation and sharing with subagents.
 - All output is JSON.
 - For bulk operations, prefer `table_insert` with multiple rows in a single call.
 - Use `table_run_sql` as a fallback for complex queries, ALTER TABLE, indexes, etc.
