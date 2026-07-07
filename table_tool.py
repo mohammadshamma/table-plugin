@@ -5,6 +5,7 @@ table_tool - A JSON-driven SQLite CLI designed for LLM integration.
 Usage:
     table_tool create-table <db> <table> <json>
     table_tool insert <db> <table> <json>
+    table_tool import-csv <db> <table> <json>
     table_tool join <db> <output_table> <json>
     table_tool group <db> <table> <json>
     table_tool query <db> <sql>
@@ -20,7 +21,9 @@ server.py exposes them as MCP tools without a subprocess round-trip.
 """
 
 import argparse
+import csv
 import json
+import re
 import sqlite3
 import sys
 
@@ -147,6 +150,172 @@ def op_insert(db: str, table: str, spec: dict) -> dict:
     except sqlite3.Error as e:
         conn.rollback()
         raise TableToolError(f"SQLite error: {e}") from e
+    finally:
+        conn.close()
+
+
+_INT_RE = re.compile(r"^[+-]?\d+$")
+_REAL_RE = re.compile(r"^[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?$")
+_TYPE_RANK = {"INTEGER": 0, "REAL": 1, "TEXT": 2}
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
+
+
+def _classify_value(value: str) -> str:
+    """Classify one trimmed, non-empty string as INTEGER, REAL, or TEXT.
+
+    Regex-gated rather than int()/float() tries: Python's parsers accept
+    underscores ("1_000") and "nan"/"inf", which must stay TEXT. A value
+    matching the integer pattern is decided here and never falls through to
+    the REAL check — "007" also matches _REAL_RE and would round-trip as 7.0.
+    """
+    if _INT_RE.match(value):
+        digits = value.lstrip("+-")
+        if len(digits) > 1 and digits[0] == "0":
+            return "TEXT"  # leading zeros carry meaning (zip codes, IDs)
+        if not _SQLITE_INT_MIN <= int(value) <= _SQLITE_INT_MAX:
+            return "TEXT"  # beyond SQLite's 64-bit INTEGER range
+        return "INTEGER"
+    if _REAL_RE.match(value):
+        return "REAL"
+    return "TEXT"
+
+
+def infer_column_types(header: list, rows: list) -> dict:
+    """Deterministically infer an SQL type per column by scanning ALL rows.
+
+    A column is INTEGER if every non-empty trimmed value classifies as
+    INTEGER, REAL if every value classifies as INTEGER or REAL, else TEXT.
+    Empty values contribute nothing; a column with no non-empty values (or
+    zero data rows) is TEXT. Returns {column: type} in header order.
+    """
+    types = {}
+    for i, name in enumerate(header):
+        rank = -1
+        for row in rows:
+            value = row[i].strip()
+            if not value:
+                continue
+            rank = max(rank, _TYPE_RANK[_classify_value(value)])
+            if rank == _TYPE_RANK["TEXT"]:
+                break
+        types[name] = ("INTEGER", "REAL", "TEXT")[rank] if rank >= 0 else "TEXT"
+    return types
+
+
+def _convert_value(value: str, col_type: str):
+    """Convert one CSV field for storage. Empty (after trim) is NULL for
+    every column type; TEXT keeps the raw untrimmed string."""
+    if not value.strip():
+        return None
+    if col_type == "INTEGER":
+        return int(value.strip())
+    if col_type == "REAL":
+        return float(value.strip())
+    return value
+
+
+def op_import_csv(db: str, table: str, spec: dict) -> dict:
+    """
+    Create and populate a new table from a local CSV file.
+
+    Spec format:
+    {
+        "file_path": "/abs/path/data.csv",   // required
+        "delimiter": ";"                      // optional, default ","
+    }
+
+    Column names come from the required header row; types are inferred by
+    infer_column_types(). Errors if the table already exists. The exists
+    check, CREATE TABLE, and all inserts run in one transaction, so a failed
+    import leaves nothing behind. The file is read fully into memory —
+    streaming in two passes is the future path for huge files.
+    """
+    if not table or not table.strip():
+        raise TableToolError("Table name cannot be empty")
+    if '"' in table:
+        raise TableToolError('Table name cannot contain a double quote (")')
+    file_path = spec.get("file_path")
+    if not file_path:
+        raise TableToolError("'file_path' is required")
+    delimiter = spec.get("delimiter", ",")
+    if not isinstance(delimiter, str) or len(delimiter) != 1:
+        raise TableToolError("'delimiter' must be a single character")
+
+    try:
+        # newline="" is required for embedded newlines in quoted fields;
+        # utf-8-sig transparently strips the BOM Excel puts on exports.
+        with open(file_path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f, delimiter=delimiter)
+            try:
+                all_rows = list(reader)
+            except csv.Error as e:
+                raise TableToolError(f"CSV parse error at line {reader.line_num}: {e}") from e
+    except (FileNotFoundError, IsADirectoryError) as e:
+        raise TableToolError(f"CSV file not found: {file_path}") from e
+    except UnicodeDecodeError as e:
+        raise TableToolError(f"CSV file is not valid UTF-8: {file_path}") from e
+
+    if not all_rows or not all_rows[0]:
+        raise TableToolError("CSV file is empty (no header row)")
+
+    header = [name.strip() for name in all_rows[0]]
+    rows = all_rows[1:]
+
+    seen = set()
+    for i, name in enumerate(header, start=1):
+        if not name:
+            raise TableToolError(f"CSV header has an empty column name (column {i})")
+        if '"' in name:
+            raise TableToolError(f"CSV column name cannot contain a double quote: {name}")
+        key = name.casefold()  # SQLite column names are case-insensitive
+        if key in seen:
+            raise TableToolError(f"Duplicate CSV column name: {name}")
+        seen.add(key)
+
+    for n, row in enumerate(rows, start=1):
+        if len(row) != len(header):
+            raise TableToolError(f"CSV row {n} has {len(row)} fields, expected {len(header)}")
+
+    columns = infer_column_types(header, rows)
+    converted = [
+        [_convert_value(value, columns[name]) for name, value in zip(header, row)]
+        for row in rows
+    ]
+
+    col_defs = ",".join(f'"{name}" {col_type}' for name, col_type in columns.items())
+    create_sql = f'CREATE TABLE "{table}" (\n  {col_defs}\n)'
+    col_list = ", ".join(f'"{name}"' for name in header)
+    placeholders = ", ".join("?" for _ in header)
+    insert_sql = f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders})'
+
+    conn = connect(db)
+    try:
+        # sqlite3 only auto-begins a transaction before DML, so BEGIN
+        # explicitly to keep the exists check, CREATE TABLE, and inserts
+        # atomic (same pattern as the job queue in server.py).
+        conn.execute("BEGIN IMMEDIATE")
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if exists:
+            raise TableToolError(f'Table "{table}" already exists; use table_drop first to replace it')
+        conn.execute(create_sql)
+        conn.executemany(insert_sql, converted)
+        conn.commit()
+        return {
+            "ok": True,
+            "table": table,
+            "inserted": len(converted),
+            "columns": columns,
+            "sql": create_sql,
+        }
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise TableToolError(f"SQLite error: {e}") from e
+    except TableToolError:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -354,6 +523,10 @@ def cmd_insert(args):
     run_op(op_insert, args.db, args.table, parse_json_arg(args.json))
 
 
+def cmd_import_csv(args):
+    run_op(op_import_csv, args.db, args.table, parse_json_arg(args.json))
+
+
 def cmd_join(args):
     run_op(op_join, args.db, args.output_table, parse_json_arg(args.json))
 
@@ -401,6 +574,13 @@ def main():
     p.add_argument("table", help="Table name")
     p.add_argument("json", help="JSON spec (or '-' for stdin)")
     p.set_defaults(func=cmd_insert)
+
+    # import-csv
+    p = sub.add_parser("import-csv", help="Create and populate a table from a CSV file")
+    p.add_argument("db", help="Path to SQLite database")
+    p.add_argument("table", help="Table name")
+    p.add_argument("json", help='JSON spec (or \'-\' for stdin), e.g. {"file_path": "/data/x.csv"}')
+    p.set_defaults(func=cmd_import_csv)
 
     # join
     p = sub.add_parser("join", help="Join two tables into a new one")

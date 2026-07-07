@@ -474,6 +474,32 @@ TOOLS = [
             "required": ["job_table"],
         },
     ),
+    types.Tool(
+        name="table_import_csv",
+        description=(
+            "Create and populate a new table from a local CSV file. Column names come from "
+            "the header row; column types (INTEGER/REAL/TEXT) are inferred deterministically "
+            "from the data. Errors if the table already exists (use table_drop first)."
+        ),
+        inputSchema={
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "additionalProperties": False,
+            "type": "object",
+            "properties": {
+                "conversation_id": CONV_ID_ARG,
+                "table": {"description": "Name of the table to create", "type": "string"},
+                "file_path": {
+                    "description": "Absolute path to a CSV file on the local filesystem",
+                    "type": "string",
+                },
+                "delimiter": {
+                    "description": 'Field delimiter, a single character (default ",")',
+                    "type": "string",
+                },
+            },
+            "required": ["table", "file_path"],
+        },
+    ),
 ]
 
 
@@ -811,6 +837,12 @@ def dispatch(name: str, args: dict) -> dict:
 
     elif name == "table_drop":
         return table_tool.op_drop(db_path, args.get("table"))
+
+    elif name == "table_import_csv":
+        spec = {"file_path": args.get("file_path")}
+        if args.get("delimiter") is not None:
+            spec["delimiter"] = args["delimiter"]
+        return table_tool.op_import_csv(db_path, args.get("table"), spec)
 
     elif name == "table_job_create":
         return op_job_create(db_path, args)
