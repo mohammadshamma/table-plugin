@@ -93,6 +93,24 @@ Then invoke `/process_table` in Antigravity, e.g.:
 /process_table summarize each row of the reviews table into reviews_summary
 ```
 
+### Permissions
+
+Under Antigravity's default review policy, every `table_job_claim` /
+`table_job_submit` call from every worker subagent triggers a permission
+prompt, which makes a parallel job impractical to babysit. Before running a
+job, relax the review policy:
+
+- **IDE**: Settings → Antigravity → Advanced Settings → Review policy →
+  "Agent Decides" or "Always Proceed".
+- **CLI**: use a `/permissions` preset, or `agy --dangerously-skip-permissions`
+  for headless runs.
+
+Note that per-tool MCP allowlisting (`"alwaysAllow"` in `mcp_config.json`) is
+[currently ignored by Antigravity](https://discuss.ai.google.dev/t/how-to-auto-approve-specific-local-mcp-tools-bypass-accept-prompt-in-antigravity/135984),
+so the policy can only be relaxed globally. A relaxed policy auto-approves
+**all** agent actions, not just the table tools — restore your usual setting
+after the job finishes.
+
 ## Inspecting your data in a browser
 
 Ask the agent to "inspect my tables" and it calls `table_inspect_start`, which

@@ -6,6 +6,8 @@ description: Process every row of a database table with parallel subagents — t
 
 Follow these steps exactly. The `table_job_*` MCP tools own all bookkeeping (row enumeration, prompt templating, assignment, retries); your only job is to pump workers until the server reports the job complete.
 
+**Permissions:** under the default review policy, each worker's `table_job_claim`/`table_job_submit` call triggers a permission prompt. Advise the user to relax the review policy before starting (IDE: Settings → Antigravity → Advanced Settings → Review policy → "Agent Decides"/"Always Proceed"; CLI: a `/permissions` preset, or `agy --dangerously-skip-permissions` for headless runs) — per-tool `"alwaysAllow"` in `mcp_config.json` is [currently ignored by Antigravity](https://discuss.ai.google.dev/t/how-to-auto-approve-specific-local-mcp-tools-bypass-accept-prompt-in-antigravity/135984). A relaxed policy auto-approves **all** agent actions, so they should restore their usual setting once the job completes.
+
 1. Determine from the user's request:
    - **source table** — the table whose rows should be processed
    - **template** — the prompt to run per row, with `{column}` placeholders (e.g. `"Summarize this review: {review_text}"`)
