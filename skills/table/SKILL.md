@@ -17,10 +17,21 @@ You have access to database tools via the `table` MCP server. Use these tools to
 - **table_schema** — Inspect table columns and types.
 - **table_list** — List all tables in a database.
 - **table_drop** — Delete a table.
+- **table_import_csv** — Create and populate a table from a local CSV file (header row required; INTEGER/REAL/TEXT column types inferred deterministically from the data). Errors if the table exists — `table_drop` it first to replace.
 - **table_job_create** — Turn every row of a table into one task in a durable work queue (the job table).
 - **table_job_claim** — Claim the next pending task; returns its id and rendered prompt, or a null task when drained.
 - **table_job_submit** — Submit a claimed task's result (or an error, which requeues it until attempts run out).
 - **table_job_status** — Task counts (total/pending/claimed/done/failed) and a `complete` flag.
+
+## Importing External Data (table_import_csv)
+
+Use `table_import_csv` whenever the user has a CSV file to get into a table. The server parses the file, infers column types (INTEGER/REAL/TEXT, deterministically), creates the table, and inserts every row — the file's contents never enter your context, and types are inferred consistently. Never read a CSV yourself and pump it through `table_insert`.
+
+> Tip: if an `/import_csv` workflow is installed, invoke it instead of improvising this recipe.
+
+- The header row is required and provides the column names.
+- The response includes the inferred `columns` and `inserted` count — report these to the user; no follow-up `table_schema` call needed.
+- If the table already exists the tool errors; ask the user before `table_drop` + retry — never drop silently.
 
 ## Processing Every Row with Subagents (table_job_* tools)
 
