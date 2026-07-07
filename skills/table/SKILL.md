@@ -22,7 +22,7 @@ You have access to database tools via the `table` MCP server. Use these tools to
 - **table_job_claim** — Claim the next pending task; returns its id and rendered prompt — or a null task when the queue is drained, or a null task with a `reason` when this worker hit its claim limit and must terminate.
 - **table_job_submit** — Submit a claimed task's result (or an error, which requeues it until attempts run out).
 - **table_job_status** — Task counts (total/pending/claimed/done/failed) and a `complete` flag.
-- **table_inspect_start** — Launch a localhost, read-only web UI for browsing any table's rows (paginated) and a status/drill-down view for job tables; returns a URL. Idempotent.
+- **table_inspect_start** — Launch a localhost, read-only web UI for browsing any table's rows (paginated, sortable by any column) and a live auto-refreshing status/drill-down view for job tables; returns a URL. Idempotent.
 - **table_inspect_stop** — Shut down the inspector web UI.
 
 ## Importing External Data (table_import_csv)
@@ -83,7 +83,7 @@ Use the `table_job_*` tools when a table's rows each need an LLM task performed 
 
 ## Browsing tables in a browser (table_inspect_* tools)
 
-When the user wants to *look at* their data rather than query it, use `table_inspect_start` to launch a local, read-only web UI and hand them the returned `url`. It lets them browse every row of any table (paginated), and renders **job tables specially**: a status summary (pending/claimed/done/failed + a `complete` flag) with a filterable, per-task drill-down that surfaces each task's error and result. The tool is idempotent — a second `table_inspect_start` just returns the URL of the already-running instance. Call `table_inspect_stop` when the user is done.
+When the user wants to *look at* their data rather than query it, use `table_inspect_start` to launch a local, read-only web UI and hand them the returned `url`. It lets them browse every row of any table (paginated, sortable asc/desc by clicking any column header), and renders **job tables specially**: a status summary (pending/claimed/done/failed + a `complete` flag) with a filterable, per-task drill-down that surfaces each task's error and result. Pages live-update in place (the job view every ~2s; auto-refresh pauses in background tabs and can be toggled off), so a running job can be watched without reloading. The tool is idempotent — a second `table_inspect_start` just returns the URL of the already-running instance. Call `table_inspect_stop` when the user is done.
 
 > Tip: if an `/inspect` workflow is installed, invoke it instead of improvising this recipe.
 

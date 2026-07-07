@@ -269,6 +269,97 @@ class InspectRenderTests(SessionScopingTestBase):
         self.assertIn("&lt;b&gt;done&lt;/b&gt;", htm)
         self.assertNotIn("<b>done</b>", htm)
 
+    def test_table_sort_desc_orders_rows(self):
+        conn = self.ro()
+        try:
+            status, htm = inspect_server.render_table(conn, "items", 1, 50, "score", "desc")
+        finally:
+            conn.close()
+        self.assertEqual(status, 200)
+        self.assertIn(">n119<", htm)                              # highest score first
+        self.assertLess(htm.index(">n119<"), htm.index(">n118<"))
+        self.assertNotIn(">n69<", htm)                            # page 1 desc = 119–70
+        self.assertIn("▼", htm)
+
+    def test_table_sort_toggle_link(self):
+        conn = self.ro()
+        try:
+            _, htm = inspect_server.render_table(conn, "items", 1, 50, "score", "desc")
+        finally:
+            conn.close()
+        self.assertIn("sort=score&dir=asc", htm)   # active column link toggles direction
+        self.assertIn("sort=name&dir=asc", htm)    # inactive column links start asc
+        self.assertNotIn("▲", htm)                 # only the active direction is marked
+
+    def test_table_invalid_sort_falls_back_to_rowid(self):
+        conn = self.ro()
+        try:
+            status, htm = inspect_server.render_table(
+                conn, "items", 1, 50, 'score"; DROP TABLE items--', "up")
+        finally:
+            conn.close()
+        self.assertEqual(status, 200)
+        self.assertIn(">n0<", htm)      # default rowid order, page 1
+        self.assertNotIn(">n50<", htm)
+
+    def test_sort_composes_with_pager(self):
+        conn = self.ro()
+        try:
+            _, htm = inspect_server.render_table(conn, "items", 1, 50, "score", "desc")
+        finally:
+            conn.close()
+        self.assertIn("sort=score&dir=desc&page=2", htm)  # Next link keeps the sort
+
+    def test_job_sort_by_status(self):
+        conn = self.ro()
+        try:
+            _, asc = inspect_server.render_job(conn, "items_job", "all", 1, 50,
+                                               "_task_status", "asc")
+            _, desc = inspect_server.render_job(conn, "items_job", "all", 1, 50,
+                                                "_task_status", "desc")
+        finally:
+            conn.close()
+        # asc: 'done' < 'failed' < 'pending' (the closing quote pins the id).
+        self.assertLess(asc.index(f'id={self.done_id}"'), asc.index(f'id={self.failed_id}"'))
+        # desc: page 1 is all pending tasks.
+        self.assertNotIn(f'id={self.done_id}"', desc)
+
+    def test_job_filter_links_carry_sort(self):
+        conn = self.ro()
+        try:
+            _, htm = inspect_server.render_job(conn, "items_job", "all", 1, 50,
+                                               "_task_attempts", "desc")
+        finally:
+            conn.close()
+        self.assertIn("status=failed&size=50&sort=_task_attempts&dir=desc", htm)
+
+    def test_refresh_script_on_live_pages(self):
+        conn = self.ro()
+        try:
+            _, job = inspect_server.render_job(conn, "items_job", "all", 1, 50)
+            _, index = inspect_server.render_index(conn)
+            _, missing = inspect_server.render_table(conn, "nope", 1, 50)
+        finally:
+            conn.close()
+        for htm in (job, index):
+            self.assertIn('id="main"', htm)
+            self.assertIn("visibilityState", htm)
+            self.assertIn('id="auto"', htm)
+        # Error pages never refresh.
+        self.assertNotIn("visibilityState", missing)
+        self.assertNotIn('id="auto"', missing)
+
+    def test_default_urls_have_no_sort_params(self):
+        conn = self.ro()
+        try:
+            _, table = inspect_server.render_table(conn, "items", 1, 50)
+            _, job = inspect_server.render_job(conn, "items_job", "all", 1, 50)
+        finally:
+            conn.close()
+        # Pager and filter links stay byte-identical to before sorting existed.
+        self.assertIn('href="/table?name=items&size=50&page=2"', table)
+        self.assertIn('href="/job?name=items_job&status=failed&size=50"', job)
+
     def test_unknown_table_is_404(self):
         conn = self.ro()
         try:
