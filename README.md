@@ -74,8 +74,9 @@ The `table_job_*` tools run a templated LLM task over **every row** of a table
 using parallel subagents, without trusting the model to enumerate rows.
 `table_job_create` copies each source row into a *job table* as a `pending`
 task (pure SQL, so nothing is missed); worker subagents then pump
-`table_job_claim` → `table_job_submit`, and the orchestrating agent loops on
-`table_job_status` until `complete`. Crashed workers are recovered via claim
+`table_job_claim` → `table_job_submit`, and the orchestrating agent keeps a
+rolling pool of ~5 single-task workers topped up — checking `table_job_status`
+as each finishes — until `complete`. Crashed workers are recovered via claim
 leases, poison rows are capped by a retry limit and marked `failed`, and
 finished work can't be overwritten — LLM nondeterminism can cost retries, but
 never rows.

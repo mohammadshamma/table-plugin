@@ -21,9 +21,9 @@ Follow these steps exactly. The `table_job_*` MCP tools own all bookkeeping (row
 
 4. Call `table_job_status` for the job table.
    - If `complete` is true, go to step 6.
-   - Otherwise continue to step 5.
+   - Otherwise dispatch `min(pending, 5)` workers as described in step 5.
 
-5. Spawn `min(pending, 5)` worker subagents **in parallel**. Assemble each worker's prompt from the three-part frame below: the opening and closing are verbatim (substitute only the job table name); the execution slot in the middle is yours to fill.
+5. Dispatch each worker as its **own background (asynchronous) subagent**, so that each worker's result comes back to you individually as it finishes — do not launch them as one blocking "run these N in parallel" batch if your harness offers a non-blocking form. Assemble each worker's prompt from the three-part frame below: the opening and closing are verbatim (substitute only the job table name); the execution slot in the middle is yours to fill.
 
    **Opening (verbatim):**
 
@@ -41,8 +41,13 @@ Follow these steps exactly. The `table_job_*` MCP tools own all bookkeeping (row
 
    **Why the frame is fixed:** one task per worker means every row is processed in a fresh context. A worker that loops back to claim again drags all previous rows' work along in its context, degrading each successive answer (context rot). The server enforces this too — by default a job refuses a second claim from the same worker. Never rewrite the frame into a loop.
 
-   When the wave finishes, go back to step 4.
+   **Replenishment — keep ~5 workers in flight:** track the number of workers in flight yourself: +1 when you dispatch one, −1 when its result returns to you. Whenever one or more worker results arrive, call `table_job_status` once and then:
+   - If `complete` is true, go to step 6.
+   - If `pending > 0`, dispatch `min(pending, 5 − in_flight)` **fresh** worker subagents, each built from the full three-part frame. A replacement is always a brand-new subagent — never send a finished worker back to claim again, and never tell one worker to process multiple rows; "keep 5 in flight" means five concurrent one-task workers.
+   - If `pending` is 0 but `complete` is false, every remaining task is claimed. Dispatch nothing. If workers are still in flight, wait for their results. If none are in flight, the claims belong to dead workers whose leases (default 600s) have not yet expired — wait, then call `table_job_status` again (the status call itself requeues expired leases) and dispatch from the new `pending` count. Never spawn "just in case" against claimed tasks.
+
+   **If your harness can only run subagents as a blocking parallel batch** (all results return together), follow the same procedure treating the batch's return as all of its completions arriving at once: call `table_job_status`, top back up to `min(pending, 5)`, repeat. That degrades to wave-at-a-time dispatch — slower, but equally correct.
 
 6. Report to the user: the job table name, the `done` count, and the `failed` count. If any tasks failed, mention that their rows carry the failure reason in the `_task_error` column of the job table.
 
-**Rules:** never read or enumerate the source rows yourself — only `table_job_status` counts decide when you are finished. Never call `table_job_claim` yourself to check progress — a claim consumes a real task; `table_job_status` is the only progress signal. Do not stop early because workers "seem" done; the job is done only when `complete` is true.
+**Rules:** never read or enumerate the source rows yourself — only `table_job_status` counts decide when you are finished. Never call `table_job_claim` yourself to check progress — a claim consumes a real task; `table_job_status` is the only progress signal. Do not stop early because workers "seem" done; the job is done only when `complete` is true — and only `pending`, never `claimed`, feeds the spawn count.
