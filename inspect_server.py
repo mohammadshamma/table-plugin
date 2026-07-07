@@ -11,7 +11,8 @@ Launched by server.py's table_inspect_start tool as a detached background
 process (never run directly by the agent, which does not know the resolved DB
 path). Serves server-side HTML with no external assets and no JavaScript
 framework, binds 127.0.0.1 only, and opens the DB in read-only mode so the
-browser can never mutate the session data.
+browser can never mutate the session data. A small inline script live-refreshes
+each page in place so job progress can be watched without reloading.
 
 Usage: inspect_server.py --db <path> --port <port>
 """
@@ -35,6 +36,8 @@ PAGE_SIZE_DEFAULT = 50
 PAGE_SIZE_MAX = 200
 PREVIEW_CHARS = 120
 IDLE_TIMEOUT = 1800  # self-exit after 30 min with no requests (zombie backstop)
+REFRESH_JOB_SECONDS = 2  # job pages track live worker progress
+REFRESH_SECONDS = 5  # other pages: row counts and results still change mid-job
 
 STATUS_FILTERS = ("all",) + table_tool.TASK_STATUSES
 
@@ -82,6 +85,33 @@ def clamp_page(page, size):
     return page, size
 
 
+SORT_DIRS = ("asc", "desc")
+
+
+def sort_key(conn, name, sort, direction):
+    """Validate a requested sort against the table's real columns (+ rowid) —
+    ORDER BY identifiers cannot be ?-bound, so only whitelisted names may be
+    interpolated. Returns (col, direction): col is None when no/invalid sort
+    was requested (the caller keeps its default order); direction is always
+    asc|desc. Call only after the table_exists gate."""
+    direction = direction if direction in SORT_DIRS else "asc"
+    if not sort:
+        return None, direction
+    cols = [r["name"] for r in conn.execute(f'PRAGMA table_info("{name}")')]
+    if sort != "rowid" and sort not in cols:
+        return None, direction
+    return sort, direction
+
+
+def order_clause(col, direction, default=""):
+    """' ORDER BY "col" ASC|DESC, rowid' — the rowid tiebreaker keeps rows with
+    equal sort keys stable across pages and refreshes."""
+    if col is None:
+        return default
+    quoted = col.replace('"', '""')
+    return f' ORDER BY "{quoted}" {direction.upper()}, rowid'
+
+
 # ─── HTML helpers ────────────────────────────────────────────────────────────
 
 STYLE = """
@@ -120,19 +150,50 @@ pre { background: #8881; padding: .6rem .8rem; border-radius: .4rem; overflow-x:
 pre.err { background: #dc262618; }
 .note { font-size: .8rem; opacity: .7; margin-top: 1.5rem; }
 .pager { margin: .8rem 0; display: flex; gap: 1rem; align-items: center; }
+.auto { font-size: .8rem; opacity: .7; display: inline-block; margin-top: .5rem; }
+"""
+
+# In-place auto-refresh: re-fetch the current URL and swap #main's children, so
+# scroll position and the #auto toggle (outside #main) survive and nothing
+# flashes. %d is the interval in ms.
+SCRIPT = """
+(() => {
+  let inflight = false;
+  async function tick() {
+    if (inflight || document.visibilityState !== "visible"
+        || !document.getElementById("auto").checked) return;
+    inflight = true;
+    try {
+      const r = await fetch(location.href, {cache: "no-store"});
+      if (!r.ok) return;  // e.g. table dropped mid-watch: keep the last page
+      const doc = new DOMParser().parseFromString(await r.text(), "text/html");
+      const fresh = doc.getElementById("main");
+      if (fresh) document.getElementById("main").innerHTML = fresh.innerHTML;
+    } catch (e) { /* server gone (idle-exit/stop): keep the last page */ }
+    finally { inflight = false; }
+  }
+  setInterval(tick, %d);
+})();
 """
 
 
-def page(title: str, body: str, crumbs: str = "") -> str:
+def page(title: str, body: str, crumbs: str = "", refresh: int = 0) -> str:
     crumb_html = f'<div class="crumbs">{crumbs}</div>' if crumbs else ""
+    live = ""
+    if refresh:
+        live = (
+            f'<label class="auto"><input type="checkbox" id="auto" checked> '
+            f"auto-refresh ({refresh}s)</label>"
+            f"<script>{SCRIPT % (refresh * 1000)}</script>"
+        )
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         f"<title>{html.escape(title)}</title><style>{STYLE}</style></head><body>"
-        f"{crumb_html}{body}"
+        f'<main id="main">{crumb_html}{body}</main>'
         '<div class="note">Read-only inspector. Status reflects the last agent '
         "activity; expired leases requeue on the next agent action.</div>"
-        "</body></html>"
+        f"{live}</body></html>"
     )
 
 
@@ -168,6 +229,22 @@ def pager(base_path: str, params: dict, page_num: int, pages: int) -> str:
     return '<div class="pager">' + "".join(parts) + "</div>"
 
 
+def sort_headers(base_path: str, params: dict, cols, sort, direction) -> str:
+    """<th> cells as sort links. cols is [(label, key)]; the active column's
+    link toggles direction and shows a ▲/▼ marker. Links omit `page` so a
+    sort change starts back at page 1."""
+    cells = []
+    for label, key in cols:
+        active = key == sort
+        nxt = "desc" if active and direction == "asc" else "asc"
+        q = urllib.parse.urlencode(dict(params, sort=key, dir=nxt))
+        marker = (" ▲" if direction == "asc" else " ▼") if active else ""
+        cells.append(
+            f'<th><a href="{base_path}?{q}">{html.escape(label)}</a>{marker}</th>'
+        )
+    return "".join(cells)
+
+
 # ─── Render functions (pure — return (status_code, html)) ────────────────────
 
 
@@ -181,7 +258,8 @@ def render_index(conn: sqlite3.Connection) -> tuple[int, str]:
     jobs = set(table_tool.list_job_tables(conn))
 
     if not tables:
-        return 200, page("Tables", "<h1>Tables</h1><p class='muted'>No tables yet.</p>")
+        return 200, page("Tables", "<h1>Tables</h1><p class='muted'>No tables yet.</p>",
+                         refresh=REFRESH_SECONDS)
 
     rows = []
     for name in tables:
@@ -201,51 +279,64 @@ def render_index(conn: sqlite3.Connection) -> tuple[int, str]:
         '<div class="wrap"><table><thead><tr><th>Table</th><th>Rows</th></tr></thead>'
         f"<tbody>{''.join(rows)}</tbody></table></div>"
     )
-    return 200, page("Tables", body)
+    return 200, page("Tables", body, refresh=REFRESH_SECONDS)
 
 
-def render_table(conn: sqlite3.Connection, name: str, page_num, size) -> tuple[int, str]:
+def render_table(conn: sqlite3.Connection, name: str, page_num, size,
+                 sort=None, direction=None) -> tuple[int, str]:
     if not name or not table_exists(conn, name):
         return 404, page("Not found", f"<h1>No such table</h1><p>{fmt(name)}</p>",
                          crumbs='<a href="/">← Tables</a>')
     page_num, size = clamp_page(page_num, size)
+    col, direction = sort_key(conn, name, sort, direction)
     total = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0]
     pages = max(1, math.ceil(total / size))
     page_num = min(page_num, pages)
     offset = (page_num - 1) * size
 
-    cur = conn.execute(f'SELECT rowid AS rowid, * FROM "{name}" LIMIT ? OFFSET ?', (size, offset))
+    cur = conn.execute(
+        f'SELECT rowid AS rowid, * FROM "{name}"{order_clause(col, direction)} LIMIT ? OFFSET ?',
+        (size, offset),
+    )
     cols = [d[0] for d in cur.description]
-    header = "".join(f"<th>{html.escape(c)}</th>" for c in cols)
     body_rows = []
     for row in cur.fetchall():
         cells = "".join(f"<td>{fmt(row[c])}</td>" for c in cols)
         body_rows.append(f"<tr>{cells}</tr>")
 
+    # sort/dir only when active, so default URLs stay identical to before.
+    params = {"name": name, "size": size}
+    if col is not None:
+        params.update(sort=col, dir=direction)
+    header = sort_headers("/table", params, [(c, c) for c in cols], col, direction)
+
     body = (
         f"<h1>{html.escape(name)}</h1>"
         f'<p class="muted">{total} row(s)</p>'
-        + pager("/table", {"name": name, "size": size}, page_num, pages)
+        + pager("/table", params, page_num, pages)
         + '<div class="wrap"><table><thead><tr>'
         + header
         + "</tr></thead><tbody>"
         + "".join(body_rows)
         + "</tbody></table></div>"
-        + pager("/table", {"name": name, "size": size}, page_num, pages)
+        + pager("/table", params, page_num, pages)
     )
-    return 200, page(name, body, crumbs='<a href="/">← Tables</a>')
+    return 200, page(name, body, crumbs='<a href="/">← Tables</a>',
+                     refresh=REFRESH_SECONDS)
 
 
-def render_job(conn: sqlite3.Connection, name: str, status, page_num, size) -> tuple[int, str]:
+def render_job(conn: sqlite3.Connection, name: str, status, page_num, size,
+               sort=None, direction=None) -> tuple[int, str]:
     if not name or not table_exists(conn, name):
         return 404, page("Not found", f"<h1>No such table</h1><p>{fmt(name)}</p>",
                          crumbs='<a href="/">← Tables</a>')
     if name not in set(table_tool.list_job_tables(conn)):
         # Not a job table — fall back to the plain row browser.
-        return render_table(conn, name, page_num, size)
+        return render_table(conn, name, page_num, size, sort, direction)
 
     status = status if status in STATUS_FILTERS else "all"
     page_num, size = clamp_page(page_num, size)
+    col, direction = sort_key(conn, name, sort, direction)
     counts = table_tool.count_task_statuses(conn, name)
     total = sum(counts.values())
     complete = counts["pending"] + counts["claimed"] == 0
@@ -259,12 +350,15 @@ def render_job(conn: sqlite3.Connection, name: str, status, page_num, size) -> t
         )
     complete_txt = ("✓ complete" if complete else "… in progress")
 
-    # Filter bar.
+    # Filter bar. Filter links carry an active sort so the two compose.
     filters = []
     for st in STATUS_FILTERS:
         label = st if st == "all" else f"{st} ({counts.get(st, 0)})"
         cls = "active" if st == status else ""
-        q = urllib.parse.urlencode({"name": name, "status": st, "size": size})
+        fq = {"name": name, "status": st, "size": size}
+        if col is not None:
+            fq.update(sort=col, dir=direction)
+        q = urllib.parse.urlencode(fq)
         filters.append(f'<a class="{cls}" href="/job?{q}">{html.escape(label)}</a>')
 
     # Task list.
@@ -277,10 +371,10 @@ def render_job(conn: sqlite3.Connection, name: str, status, page_num, size) -> t
     offset = (page_num - 1) * size
 
     srccols = source_columns(conn, name)
-    src_headers = "".join(f"<th>{html.escape(c)}</th>" for c in srccols)
     task_rows = []
+    order = order_clause(col, direction, default=" ORDER BY rowid")
     for row in conn.execute(
-        f'SELECT rowid AS _task_id, * FROM "{name}"{where} ORDER BY rowid LIMIT ? OFFSET ?',
+        f'SELECT rowid AS _task_id, * FROM "{name}"{where}{order} LIMIT ? OFFSET ?',
         (size, offset),
     ):
         tid = row["_task_id"]
@@ -296,7 +390,18 @@ def render_job(conn: sqlite3.Connection, name: str, status, page_num, size) -> t
             f"<td>{preview(outcome)}</td></tr>"
         )
 
+    # sort/dir only when active, so default URLs stay identical to before.
     params = {"name": name, "status": status, "size": size}
+    if col is not None:
+        params.update(sort=col, dir=direction)
+    # The Result / error cell is computed, so it sorts by the real `result`
+    # column (failed rows have a NULL result and group together).
+    header_cols = (
+        [("Task", "rowid"), ("Status", "_task_status"),
+         ("Attempts", "_task_attempts"), ("Claimed by", "_task_claimed_by")]
+        + [(c, c) for c in srccols]
+        + [("Result / error", "result")]
+    )
     body = (
         f"<h1>{html.escape(name)} <span class='badge job'>job</span></h1>"
         f'<p class="muted">{html.escape(complete_txt)}</p>'
@@ -304,14 +409,14 @@ def render_job(conn: sqlite3.Connection, name: str, status, page_num, size) -> t
         f'<div class="filters">{"".join(filters)}</div>'
         + pager("/job", params, page_num, pages)
         + '<div class="wrap"><table><thead><tr>'
-        + "<th>Task</th><th>Status</th><th>Attempts</th><th>Claimed by</th>"
-        + src_headers
-        + "<th>Result / error</th></tr></thead><tbody>"
+        + sort_headers("/job", params, header_cols, col, direction)
+        + "</tr></thead><tbody>"
         + ("".join(task_rows) or '<tr><td colspan="99" class="muted">No tasks.</td></tr>')
         + "</tbody></table></div>"
         + pager("/job", params, page_num, pages)
     )
-    return 200, page(name, body, crumbs='<a href="/">← Tables</a>')
+    return 200, page(name, body, crumbs='<a href="/">← Tables</a>',
+                     refresh=REFRESH_JOB_SECONDS)
 
 
 def render_task(conn: sqlite3.Connection, name: str, rowid) -> tuple[int, str]:
@@ -362,22 +467,24 @@ def render_task(conn: sqlite3.Connection, name: str, rowid) -> tuple[int, str]:
         "<h2>Task bookkeeping</h2>"
         f"{book}{err_html}{result_html}"
     )
-    return 200, page(f"Task #{rowid}", body, crumbs=crumbs)
+    return 200, page(f"Task #{rowid}", body, crumbs=crumbs, refresh=REFRESH_SECONDS)
 
 
 # ─── HTTP plumbing ───────────────────────────────────────────────────────────
 
 ROUTES = {
     "/table": lambda conn, q: render_table(conn, q.get("name", [""])[0],
-                                           q.get("page", [1])[0], q.get("size", [PAGE_SIZE_DEFAULT])[0]),
+                                           q.get("page", [1])[0], q.get("size", [PAGE_SIZE_DEFAULT])[0],
+                                           q.get("sort", [None])[0], q.get("dir", [None])[0]),
     "/job": lambda conn, q: render_job(conn, q.get("name", [""])[0], q.get("status", ["all"])[0],
-                                       q.get("page", [1])[0], q.get("size", [PAGE_SIZE_DEFAULT])[0]),
+                                       q.get("page", [1])[0], q.get("size", [PAGE_SIZE_DEFAULT])[0],
+                                       q.get("sort", [None])[0], q.get("dir", [None])[0]),
     "/task": lambda conn, q: render_task(conn, q.get("name", [""])[0], q.get("id", [None])[0]),
 }
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "table-inspector/0.0.4"
+    server_version = "table-inspector/0.0.5"
 
     def log_message(self, *args):
         pass  # stdout/stderr are /dev/null anyway; stay quiet
@@ -404,7 +511,8 @@ class Handler(BaseHTTPRequestHandler):
         except sqlite3.OperationalError:
             # DB file not created yet (no tables). Present an empty state.
             self._send(200, page("Tables", "<h1>Tables</h1>"
-                                 "<p class='muted'>No database yet — create a table first.</p>"))
+                                 "<p class='muted'>No database yet — create a table first.</p>",
+                                 refresh=REFRESH_SECONDS))
             return
 
         try:

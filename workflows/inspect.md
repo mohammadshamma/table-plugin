@@ -22,9 +22,11 @@ paste table rows into your context.
    the existing URL (`already_running: true`); do not try to start a second one.
 
 4. Give the user the returned `url` and tell them to open it in a browser. Mention
-   that they can browse every table's rows (paginated) and that **job tables get a
-   special view**: a status summary (pending/claimed/done/failed and a complete
-   flag) with a filterable, per-task drill-down showing each task's error and result.
+   that they can browse every table's rows (paginated, and sortable by clicking any
+   column header) and that **job tables get a special view**: a status summary
+   (pending/claimed/done/failed and a complete flag) with a filterable, per-task
+   drill-down showing each task's error and result. Pages auto-refresh in place
+   (the job view every ~2s), so a running job can be watched live without reloading.
 
 5. When the user is done — or says "stop" / "turn it off" / "close the inspector" —
    call `table_inspect_stop`.
