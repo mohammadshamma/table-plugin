@@ -1,6 +1,6 @@
 # Table Plugin for Antigravity
 
-An Antigravity plugin that gives agents database capabilities through structured tools.
+An Antigravity plugin that gives agents database capabilities through structured tools — including a **durable job queue** that fans a templated task out over every row of a table using parallel subagents.
 
 ## Why this exists
 
@@ -18,6 +18,8 @@ A typical workflow looks like this:
 2. Main agent delegates to a subagent: *"Read data.csv and insert its rows into the `sales` table."*
 3. Subagent does the heavy lifting (parsing, inserting), then exits.
 4. Main agent queries the populated table — grouping, joining, aggregating — without any raw data ever touching its context.
+
+The [job queue](#job-processing-run-a-task-over-every-row) takes this pattern further: instead of one subagent loading a table, a pool of parallel subagents processes every row of one, with durable bookkeeping that guarantees no row is skipped, dropped, or double-processed.
 
 ## Prerequisites
 
@@ -47,6 +49,7 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 | `table_schema` | Inspect table columns and types |
 | `table_list` | List all tables in a database |
 | `table_drop` | Drop a table |
+| `table_import_csv` | Import a CSV file into a new table with inferred column types |
 | `table_job_create` | Turn every row of a table into one task in a durable work queue |
 | `table_job_claim` | Claim the next pending task (id + rendered prompt) |
 | `table_job_submit` | Submit a claimed task's result or error |
@@ -68,18 +71,31 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 
 Antigravity agents will automatically use the table tools to execute these operations.
 
-## Row-level fan-out with subagents
+## Job processing: run a task over every row
 
-The `table_job_*` tools run a templated LLM task over **every row** of a table
-using parallel subagents, without trusting the model to enumerate rows.
-`table_job_create` copies each source row into a *job table* as a `pending`
-task (pure SQL, so nothing is missed); worker subagents then pump
-`table_job_claim` → `table_job_submit`, and the orchestrating agent keeps a
-rolling pool of ~5 single-task workers topped up — checking `table_job_status`
-as each finishes — until `complete`. Crashed workers are recovered via claim
-leases, poison rows are capped by a retry limit and marked `failed`, and
-finished work can't be overwritten — LLM nondeterminism can cost retries, but
-never rows.
+The `table_job_*` tools are a **durable work queue** that runs a templated LLM
+task over **every row** of a table using parallel subagents, without trusting
+the model to enumerate rows. `table_job_create` copies each source row into a
+*job table* as a `pending` task (pure SQL, so nothing is missed); worker
+subagents then pump `table_job_claim` → `table_job_submit`, and the
+orchestrating agent keeps a rolling pool of ~5 single-task workers topped up —
+checking `table_job_status` as each finishes — until `complete`.
+
+The queue is built so that LLM nondeterminism can cost retries, but never rows:
+
+- **Every row becomes exactly one task** — job creation is a pure SQL copy;
+  the model never lists rows.
+- **Crashed workers can't strand work** — claims carry a lease, and expired
+  leases are automatically requeued.
+- **Poison rows can't loop forever** — retries are capped (`max_attempts`,
+  default 3), after which the task is marked `failed` rather than dropped.
+- **Finished work can't be overwritten** — a `done` task rejects further
+  submissions.
+- **Each worker gets a fresh context** — workers claim one task by default
+  (`max_claims_per_worker`), so no row is processed by a context polluted by
+  previous rows.
+- **Safe under real parallelism** — SQLite WAL mode, immediate transactions,
+  and busy timeouts let separate worker processes hammer the same queue.
 
 For a one-command entry point, copy the bundled workflow into your project
 (or your global workflows directory) once:
