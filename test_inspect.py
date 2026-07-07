@@ -170,10 +170,11 @@ class InspectRenderTests(SessionScopingTestBase):
             "table": "items",
             "rows": [{"name": f"n{i}", "score": i} for i in range(120)],
         })
-        # A job over it with max_attempts=1 so a single error → failed.
+        # A job over it with max_attempts=1 so a single error → failed, and no
+        # per-worker claim cap: this fixture claims twice from one process.
         self.call_tool_sync("table_job_create", {
             "table": "items", "template": "Do {name}", "job_table": "items_job",
-            "max_attempts": 1,
+            "max_attempts": 1, "max_claims_per_worker": 0,
         })
         c1 = self.call_tool_sync("table_job_claim", {"job_table": "items_job"})
         self.done_id = c1["task"]["task_id"]

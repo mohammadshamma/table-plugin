@@ -136,7 +136,10 @@ def find_root_conversation(current_id: str, brain_dir: Path) -> str:
 def is_writable(path: Path) -> bool:
     """Helper to check if a directory is writable for SQLite databases."""
     import sqlite3
-    test_db = path / ".test_write.db"
+    # The probe filename must be unique per process AND thread: concurrent
+    # workers racing a shared probe file delete it out from under each other,
+    # making the loser silently fall back to the scratch DB (wrong database).
+    test_db = path / f".test_write-{os.getpid()}-{threading.get_ident()}.db"
     try:
         conn = sqlite3.connect(test_db)
         conn.execute("PRAGMA journal_mode=WAL")
@@ -421,6 +424,14 @@ TOOLS = [
                     "description": "Times a task may be handed out before it is marked failed (default: 3)",
                     "type": "number",
                 },
+                "max_claims_per_worker": {
+                    "description": (
+                        "Max tasks one worker agent may claim in its lifetime (default: 1 — "
+                        "claim, submit, terminate; 0 = unlimited). Keeps each row in a fresh "
+                        "worker context."
+                    ),
+                    "type": "number",
+                },
             },
             "required": ["table", "template", "job_table"],
         },
@@ -428,8 +439,11 @@ TOOLS = [
     types.Tool(
         name="table_job_claim",
         description=(
-            "Claim the next pending task of a job. Returns the task id and its rendered prompt, "
-            "or a null task when no work remains. Called by worker subagents."
+            "Claim the next pending task of a job. Returns the task id and its rendered prompt; "
+            "or a null task with remaining_pending 0 when no work remains; or a null task with a "
+            "'reason' when this worker has hit the job's per-worker claim limit and must terminate "
+            "so fresh workers continue. Called by worker subagents — orchestrators check progress "
+            "with table_job_status, never by claiming."
         ),
         inputSchema={
             "$schema": "http://json-schema.org/draft-07/schema#",
@@ -552,6 +566,14 @@ TOOLS = [
 JOBS_TABLE = table_tool.JOBS_TABLE
 RESERVED_TASK_COLUMNS = table_tool.RESERVED_TASK_COLUMNS
 
+# Claims made by THIS process, keyed by (resolved db path, job_table). The
+# `max_claims_per_worker` cap cannot key on _task_claimed_by (every worker
+# passes the parent conversation's id), but each worker subagent runs its own
+# server process, so an in-process counter is a per-worker counter. Same
+# module-level dict + lock idiom as LINEAGE_CACHE.
+WORKER_CLAIM_COUNTS: dict = {}
+WORKER_CLAIM_COUNTS_LOCK = threading.Lock()
+
 
 def job_connect(db: str) -> sqlite3.Connection:
     """Connection with explicit transaction control for atomic claims.
@@ -588,9 +610,18 @@ def ensure_jobs_table(conn: sqlite3.Connection) -> None:
         "  template TEXT,\n"
         "  lease_seconds REAL,\n"
         "  max_attempts INTEGER,\n"
+        "  max_claims_per_worker INTEGER,\n"
         "  created_at REAL\n"
         ")"
     )
+    cols = {r["name"] for r in conn.execute(f'PRAGMA table_info("{JOBS_TABLE}")')}
+    if "max_claims_per_worker" not in cols:
+        # Registry created before the claim cap existed. NULL = unlimited (the
+        # old behavior for existing jobs); op_job_create stores a resolved value.
+        try:
+            conn.execute(f'ALTER TABLE "{JOBS_TABLE}" ADD COLUMN max_claims_per_worker INTEGER')
+        except sqlite3.OperationalError:
+            pass  # another worker process won the migration race
 
 
 def get_job(conn: sqlite3.Connection, job_table: str) -> dict:
@@ -629,6 +660,8 @@ def op_job_create(db: str, args: dict) -> dict:
     lease_seconds = 600.0 if lease_raw is None else float(lease_raw)
     attempts_raw = args.get("max_attempts")
     max_attempts = 3 if attempts_raw is None else int(attempts_raw)
+    claims_raw = args.get("max_claims_per_worker")
+    max_claims_per_worker = 1 if claims_raw is None else int(claims_raw)
 
     if not source or not source.strip():
         raise table_tool.TableToolError("Table name cannot be empty")
@@ -640,6 +673,8 @@ def op_job_create(db: str, args: dict) -> dict:
         raise table_tool.TableToolError("'lease_seconds' must be non-negative")
     if max_attempts < 1:
         raise table_tool.TableToolError("'max_attempts' must be at least 1")
+    if max_claims_per_worker < 0:
+        raise table_tool.TableToolError("'max_claims_per_worker' must be non-negative (0 = unlimited)")
 
     conn = job_connect(db)
     try:
@@ -678,9 +713,11 @@ def op_job_create(db: str, args: dict) -> dict:
         try:
             conn.execute(
                 f'INSERT INTO "{JOBS_TABLE}" '
-                "(job_table, source_table, template, lease_seconds, max_attempts, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (job_table, source, template, lease_seconds, max_attempts, time.time()),
+                "(job_table, source_table, template, lease_seconds, max_attempts, "
+                "max_claims_per_worker, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (job_table, source, template, lease_seconds, max_attempts,
+                 max_claims_per_worker, time.time()),
             )
             conn.execute(f'CREATE TABLE "{job_table}" AS SELECT * FROM "{source}"')
             conn.execute(f'ALTER TABLE "{job_table}" ADD COLUMN "result" TEXT')
@@ -695,7 +732,17 @@ def op_job_create(db: str, args: dict) -> dict:
             conn.execute("ROLLBACK")
             raise table_tool.TableToolError(f"SQLite error: {e}") from e
 
-        return {"ok": True, "job_table": job_table, "total_tasks": total}
+        # A job name can be re-registered after manual deregistration; the new
+        # job must not inherit claim counts from an older namesake.
+        with WORKER_CLAIM_COUNTS_LOCK:
+            WORKER_CLAIM_COUNTS.pop((db, job_table), None)
+
+        return {
+            "ok": True,
+            "job_table": job_table,
+            "total_tasks": total,
+            "max_claims_per_worker": max_claims_per_worker,
+        }
     finally:
         conn.close()
 
@@ -708,45 +755,91 @@ def op_job_claim(db: str, args: dict) -> dict:
         job = get_job(conn, args.get("job_table"))
         job_table = job["job_table"]
 
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            sweep_expired_leases(conn, job)
-            row = conn.execute(
-                f'SELECT rowid AS _task_id, * FROM "{job_table}" '
-                "WHERE _task_status = 'pending' ORDER BY rowid LIMIT 1"
-            ).fetchone()
-            if row is None:
-                conn.execute("COMMIT")
-                return {"task": None, "remaining_pending": 0}
+        # Per-worker claim cap. NULL (job predates the cap) and 0 both mean
+        # unlimited. Refusal happens before the transaction: a capped worker
+        # does no DB work at all, and its null task is structurally distinct
+        # from a drained queue (reason/claim_limit vs remaining_pending).
+        cap_raw = job.get("max_claims_per_worker")
+        cap = int(cap_raw) if cap_raw else 0
+        counter_key = (db, job_table)
+        if cap:
+            with WORKER_CLAIM_COUNTS_LOCK:
+                made = WORKER_CLAIM_COUNTS.get(counter_key, 0)
+                if made >= cap:
+                    return {
+                        "task": None,
+                        "reason": (
+                            f"worker claim limit reached ({cap} per worker) — submit any "
+                            "outstanding result, then terminate; fresh workers will "
+                            "continue this job"
+                        ),
+                        "claim_limit": cap,
+                    }
+                # Reserve the slot; released below if no task is actually
+                # claimed. Never hold the lock across SQLite I/O.
+                WORKER_CLAIM_COUNTS[counter_key] = made + 1
 
-            task_id = row["_task_id"]
-            conn.execute(
-                f'UPDATE "{job_table}" SET '
-                "  _task_status = 'claimed', "
-                "  _task_attempts = _task_attempts + 1, "
-                "  _task_lease_expires = ?, "
-                "  _task_claimed_by = ? "
-                "WHERE rowid = ?",
-                (time.time() + job["lease_seconds"], worker_id, task_id),
-            )
-            remaining = conn.execute(
-                f'SELECT COUNT(*) FROM "{job_table}" WHERE _task_status = \'pending\''
-            ).fetchone()[0]
-            conn.execute("COMMIT")
-        except sqlite3.Error as e:
-            conn.execute("ROLLBACK")
-            raise table_tool.TableToolError(f"SQLite error: {e}") from e
+        claimed = False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                sweep_expired_leases(conn, job)
+                row = conn.execute(
+                    f'SELECT rowid AS _task_id, * FROM "{job_table}" '
+                    "WHERE _task_status = 'pending' ORDER BY rowid LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    return {"task": None, "remaining_pending": 0}
+
+                task_id = row["_task_id"]
+                conn.execute(
+                    f'UPDATE "{job_table}" SET '
+                    "  _task_status = 'claimed', "
+                    "  _task_attempts = _task_attempts + 1, "
+                    "  _task_lease_expires = ?, "
+                    "  _task_claimed_by = ? "
+                    "WHERE rowid = ?",
+                    (time.time() + job["lease_seconds"], worker_id, task_id),
+                )
+                remaining = conn.execute(
+                    f'SELECT COUNT(*) FROM "{job_table}" WHERE _task_status = \'pending\''
+                ).fetchone()[0]
+                conn.execute("COMMIT")
+            except sqlite3.Error as e:
+                conn.execute("ROLLBACK")
+                raise table_tool.TableToolError(f"SQLite error: {e}") from e
+            claimed = True
+        finally:
+            if cap and not claimed:
+                with WORKER_CLAIM_COUNTS_LOCK:
+                    WORKER_CLAIM_COUNTS[counter_key] -= 1
 
         row_values = {
             k: v for k, v in dict(row).items()
             if k != "_task_id" and k not in RESERVED_TASK_COLUMNS
         }
         try:
+            # A render failure keeps the reserved slot: the claim is already
+            # committed (it also consumed a _task_attempts); the lease sweep
+            # recovers the task.
             prompt = job["template"].format(**row_values)
         except Exception as e:
             raise table_tool.TableToolError(f"Failed to render template for task {task_id}: {e}") from e
 
-        return {"task": {"task_id": task_id, "prompt": prompt}, "remaining_pending": remaining}
+        result = {"task": {"task_id": task_id, "prompt": prompt}, "remaining_pending": remaining}
+        if cap:
+            with WORKER_CLAIM_COUNTS_LOCK:
+                made = WORKER_CLAIM_COUNTS.get(counter_key, 0)
+            if made >= cap:
+                result["note"] = (
+                    f"This is your last claim for this job (limit {cap} per worker). "
+                    "Submit the result with table_job_submit, then terminate — do not "
+                    "call table_job_claim again; fresh workers handle the remaining tasks."
+                )
+            else:
+                result["note"] = f"Claim {made} of {cap} allowed for this worker."
+        return result
     finally:
         conn.close()
 
