@@ -47,6 +47,10 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 | `table_schema` | Inspect table columns and types |
 | `table_list` | List all tables in a database |
 | `table_drop` | Drop a table |
+| `table_job_create` | Turn every row of a table into one task in a durable work queue |
+| `table_job_claim` | Claim the next pending task (id + rendered prompt) |
+| `table_job_submit` | Submit a claimed task's result or error |
+| `table_job_status` | Task counts and a `complete` flag |
 
 ## Example conversation
 
@@ -61,6 +65,31 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 ```
 
 Antigravity agents will automatically use the table tools to execute these operations.
+
+## Row-level fan-out with subagents
+
+The `table_job_*` tools run a templated LLM task over **every row** of a table
+using parallel subagents, without trusting the model to enumerate rows.
+`table_job_create` copies each source row into a *job table* as a `pending`
+task (pure SQL, so nothing is missed); worker subagents then pump
+`table_job_claim` → `table_job_submit`, and the orchestrating agent loops on
+`table_job_status` until `complete`. Crashed workers are recovered via claim
+leases, poison rows are capped by a retry limit and marked `failed`, and
+finished work can't be overwritten — LLM nondeterminism can cost retries, but
+never rows.
+
+For a one-command entry point, copy the bundled workflow into your project
+(or your global workflows directory) once:
+
+```bash
+cp workflows/process_table.md /path/to/your/project/.agent/workflows/
+```
+
+Then invoke `/process_table` in Antigravity, e.g.:
+
+```
+/process_table summarize each row of the reviews table into reviews_summary
+```
 
 ## Architecture
 
@@ -77,10 +106,12 @@ remains usable standalone as a CLI.
 
 ## Development
 
-Run the tests (pure stdlib, no dependencies):
+Run the test suites:
 
 ```bash
-python3 -m unittest -v
+uv run test_session_scoping.py         # server + session-scoped routing
+uv run test_table_jobs.py              # table_job_* work-queue tools
+python3 -m unittest test_table_tool -v # table_tool CLI (pure stdlib)
 ```
 
 ## Troubleshooting
