@@ -16,10 +16,15 @@ Run with: uv run server.py  (uv provisions Python and the mcp SDK)
 import json
 import os
 import re
+import signal
+import socket
 import sqlite3
 import string
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -500,6 +505,39 @@ TOOLS = [
             "required": ["table", "file_path"],
         },
     ),
+    types.Tool(
+        name="table_inspect_start",
+        description=(
+            "Start a local, read-only web UI for browsing this session's tables in a browser: "
+            "every row of any table (paginated), plus a status/drill-down view for job tables. "
+            "Returns a localhost URL to give the user. Idempotent — returns the existing URL if "
+            "already running. Stop it with table_inspect_stop."
+        ),
+        inputSchema={
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "additionalProperties": False,
+            "type": "object",
+            "properties": {
+                "conversation_id": CONV_ID_ARG,
+                "port": {
+                    "description": "Preferred TCP port (default 8760); falls back to the next free port if occupied",
+                    "type": "number",
+                },
+            },
+        },
+    ),
+    types.Tool(
+        name="table_inspect_stop",
+        description="Stop the local table-inspector web UI started by table_inspect_start.",
+        inputSchema={
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "additionalProperties": False,
+            "type": "object",
+            "properties": {
+                "conversation_id": CONV_ID_ARG,
+            },
+        },
+    ),
 ]
 
 
@@ -509,18 +547,10 @@ TOOLS = [
 # work queue, drained by worker subagents through claim/submit. All bookkeeping
 # lives in SQL so LLM nondeterminism can only cost retries, never missed rows.
 
-JOBS_TABLE = "_table_jobs"
-
-# Columns the job table adds on top of the source columns. Source tables must
-# not use these names.
-RESERVED_TASK_COLUMNS = (
-    "result",
-    "_task_status",
-    "_task_error",
-    "_task_attempts",
-    "_task_lease_expires",
-    "_task_claimed_by",
-)
+# The registry table name and reserved column tuple live in table_tool so the
+# read-only web inspector shares the exact same definitions (see table_tool.py).
+JOBS_TABLE = table_tool.JOBS_TABLE
+RESERVED_TASK_COLUMNS = table_tool.RESERVED_TASK_COLUMNS
 
 
 def job_connect(db: str) -> sqlite3.Connection:
@@ -781,12 +811,7 @@ def op_job_status(db: str, args: dict) -> dict:
         conn.execute("BEGIN IMMEDIATE")
         try:
             sweep_expired_leases(conn, job)
-            counts = {"pending": 0, "claimed": 0, "done": 0, "failed": 0}
-            for row in conn.execute(
-                f'SELECT _task_status, COUNT(*) AS n FROM "{job_table}" GROUP BY _task_status'
-            ):
-                if row["_task_status"] in counts:
-                    counts[row["_task_status"]] = row["n"]
+            counts = table_tool.count_task_statuses(conn, job_table)
             conn.execute("COMMIT")
         except sqlite3.Error as e:
             conn.execute("ROLLBACK")
@@ -800,6 +825,163 @@ def op_job_status(db: str, args: dict) -> dict:
         }
     finally:
         conn.close()
+
+
+# ─── Web inspector (table_inspect_* tools) ───────────────────────────────────
+#
+# A localhost, read-only web UI for browsing the session's tables and jobs in a
+# browser. The agent turns it on/off via table_inspect_start/stop. The launcher
+# must live here because only this process can resolve the session DB path (via
+# get_resolved_db_path); it hands that path to inspect_server.py, spawned as a
+# detached background subprocess so it outlives this stdio server.
+
+DEFAULT_INSPECT_PORT = 8760
+INSPECT_PIDFILE_NAME = ".inspect.json"
+INSPECT_PORT_ATTEMPTS = 20
+
+
+def inspect_paths(db_path: str) -> tuple[Path, Path]:
+    """(pidfile, web-server script) for a given resolved DB path.
+
+    The pidfile sits next to the DB so inspector state is per-session and gets
+    cleaned up with the session; the script ships alongside server.py.
+    """
+    pidfile = Path(db_path).parent / INSPECT_PIDFILE_NAME
+    script = Path(__file__).resolve().parent / "inspect_server.py"
+    return pidfile, script
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this pid exists and is signalable."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    return True
+
+
+def _read_inspect_pidfile(pidfile: Path) -> dict | None:
+    try:
+        return json.loads(pidfile.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _pick_free_port(preferred: int) -> int:
+    """First free localhost port at or above `preferred` (wrapping stays in range)."""
+    for offset in range(INSPECT_PORT_ATTEMPTS):
+        port = preferred + offset
+        if port > 65535:
+            break
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise table_tool.TableToolError(
+        f"No free port found in range {preferred}-{preferred + INSPECT_PORT_ATTEMPTS - 1}"
+    )
+
+
+def _inspector_healthy(port: int, timeout: float = 0.3) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=timeout):
+            return True
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def op_inspect_start(db: str, args: dict) -> dict:
+    pidfile, script = inspect_paths(db)
+
+    # Idempotent: reuse a live instance rather than stacking servers.
+    existing = _read_inspect_pidfile(pidfile)
+    if existing and _pid_alive(existing.get("pid", 0)):
+        return {
+            "ok": True,
+            "already_running": True,
+            "url": existing.get("url"),
+            "port": existing.get("port"),
+            "db": db,
+        }
+    if existing:
+        pidfile.unlink(missing_ok=True)  # stale (dead pid)
+
+    if not script.is_file():
+        raise table_tool.TableToolError(f"Inspector script not found: {script}")
+
+    port_raw = args.get("port")
+    preferred = DEFAULT_INSPECT_PORT if port_raw is None else int(port_raw)
+    if not (1024 <= preferred <= 65535):
+        raise table_tool.TableToolError("'port' must be between 1024 and 65535")
+    port = _pick_free_port(preferred)
+
+    # Run the (stdlib-only) inspector with this server's own interpreter rather
+    # than `uv run`: sys.executable is guaranteed to exist and satisfy the
+    # >=3.10 requirement, with no PATH lookup, uv resolution, or network access.
+    # Detached so it survives this stdio server; DEVNULL so it never writes to
+    # the MCP stdout stream (which would corrupt the JSON-RPC protocol).
+    proc = subprocess.Popen(
+        [sys.executable, str(script), "--db", db, "--port", str(port)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise table_tool.TableToolError(
+                f"Inspector exited immediately (code {proc.returncode})"
+            )
+        if _inspector_healthy(port):
+            break
+        time.sleep(0.15)
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            proc.kill()
+        raise table_tool.TableToolError("Inspector did not become healthy in time")
+
+    url = f"http://127.0.0.1:{port}/"
+    record = {"pid": proc.pid, "port": port, "url": url, "started_at": time.time()}
+    try:
+        pidfile.write_text(json.dumps(record))
+    except OSError as e:
+        raise table_tool.TableToolError(f"Could not write inspector pidfile: {e}") from e
+
+    return {"ok": True, "url": url, "port": port, "db": db}
+
+
+def op_inspect_stop(db: str, args: dict) -> dict:
+    pidfile, _ = inspect_paths(db)
+    record = _read_inspect_pidfile(pidfile)
+    if not record:
+        return {"ok": True, "was_running": False}
+
+    pid = record.get("pid", 0)
+    stopped = False
+    if _pid_alive(pid):
+        # Signal the whole session group (start_new_session made pid the leader).
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            stopped = True
+        except (ProcessLookupError, OSError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                stopped = True
+            except (ProcessLookupError, OSError):
+                stopped = False
+    pidfile.unlink(missing_ok=True)
+    return {"ok": True, "was_running": stopped, "stopped_pid": pid if stopped else None}
 
 
 def dispatch(name: str, args: dict) -> dict:
@@ -856,11 +1038,17 @@ def dispatch(name: str, args: dict) -> dict:
     elif name == "table_job_status":
         return op_job_status(db_path, args)
 
+    elif name == "table_inspect_start":
+        return op_inspect_start(db_path, args)
+
+    elif name == "table_inspect_stop":
+        return op_inspect_stop(db_path, args)
+
     else:
         raise ValueError(f"Unknown tool: {name}")
 
 
-server = Server("table", version="0.0.3")
+server = Server("table", version="0.0.4")
 
 
 @server.list_tools()

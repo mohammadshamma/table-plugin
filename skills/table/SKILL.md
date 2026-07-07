@@ -22,6 +22,8 @@ You have access to database tools via the `table` MCP server. Use these tools to
 - **table_job_claim** — Claim the next pending task; returns its id and rendered prompt, or a null task when drained.
 - **table_job_submit** — Submit a claimed task's result (or an error, which requeues it until attempts run out).
 - **table_job_status** — Task counts (total/pending/claimed/done/failed) and a `complete` flag.
+- **table_inspect_start** — Launch a localhost, read-only web UI for browsing any table's rows (paginated) and a status/drill-down view for job tables; returns a URL. Idempotent.
+- **table_inspect_stop** — Shut down the inspector web UI.
 
 ## Importing External Data (table_import_csv)
 
@@ -57,6 +59,15 @@ Use the `table_job_*` tools when a table's rows each need an LLM task performed 
 - A task that keeps failing is retried up to `max_attempts` (default 3), then marked `failed` with its error — never silently dropped.
 - Duplicate or stale submits are rejected; finished work cannot be overwritten.
 - The job table persists in the session database, so an interrupted job can be resumed later by simply running the status/spawn loop again.
+
+## Browsing tables in a browser (table_inspect_* tools)
+
+When the user wants to *look at* their data rather than query it, use `table_inspect_start` to launch a local, read-only web UI and hand them the returned `url`. It lets them browse every row of any table (paginated), and renders **job tables specially**: a status summary (pending/claimed/done/failed + a `complete` flag) with a filterable, per-task drill-down that surfaces each task's error and result. The tool is idempotent — a second `table_inspect_start` just returns the URL of the already-running instance. Call `table_inspect_stop` when the user is done.
+
+> Tip: if an `/inspect` workflow is installed, invoke it instead of improvising this recipe.
+
+- The inspector is bound to `127.0.0.1` and opens the database **read-only** — it can never modify session data.
+- Its `claimed` counts can lag a live `table_job_status` because the read-only view does not requeue expired leases; `table_job_status` remains the source of truth for orchestration loops.
 
 ## Usage Notes
 

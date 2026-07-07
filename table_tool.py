@@ -505,6 +505,62 @@ def op_drop(db: str, table: str) -> dict:
         conn.close()
 
 
+# ─── Shared job-queue read helpers ───────────────────────────────────────────
+#
+# These live here (rather than in server.py) because both the MCP server and
+# the read-only web inspector (inspect_server.py) import table_tool but not each
+# other. Keeping the job registry name, reserved columns, and status counting in
+# one place guarantees the two processes never disagree about a job's state.
+
+# The registry table listing every job (see server.py's ensure_jobs_table).
+JOBS_TABLE = "_table_jobs"
+
+# Columns a job table adds on top of its source columns. Source tables must not
+# use these names.
+RESERVED_TASK_COLUMNS = (
+    "result",
+    "_task_status",
+    "_task_error",
+    "_task_attempts",
+    "_task_lease_expires",
+    "_task_claimed_by",
+)
+
+# The task lifecycle states, in the order a status view should present them.
+TASK_STATUSES = ("pending", "claimed", "done", "failed")
+
+
+def count_task_statuses(conn: sqlite3.Connection, job_table: str) -> dict:
+    """Count a job table's rows by _task_status.
+
+    Returns a dict with a zero-filled key for every state in TASK_STATUSES so
+    callers can rely on all four being present. The caller owns the transaction
+    (and any lease sweep); this is a pure read.
+    """
+    counts = {status: 0 for status in TASK_STATUSES}
+    for row in conn.execute(
+        f'SELECT _task_status, COUNT(*) AS n FROM "{job_table}" GROUP BY _task_status'
+    ):
+        if row["_task_status"] in counts:
+            counts[row["_task_status"]] = row["n"]
+    return counts
+
+
+def list_job_tables(conn: sqlite3.Connection) -> list:
+    """Names of all registered job tables, or [] if no jobs exist yet.
+
+    Guarded against the registry table not existing (a database that has never
+    created a job), so read-only callers need no setup.
+    """
+    try:
+        rows = conn.execute(
+            f'SELECT job_table FROM "{JOBS_TABLE}" ORDER BY job_table'
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # registry table absent → no jobs
+    return [r["job_table"] for r in rows]
+
+
 # ─── CLI Commands ────────────────────────────────────────────────────────────
 
 
