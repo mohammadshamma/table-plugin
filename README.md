@@ -51,6 +51,8 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 | `table_job_claim` | Claim the next pending task (id + rendered prompt) |
 | `table_job_submit` | Submit a claimed task's result or error |
 | `table_job_status` | Task counts and a `complete` flag |
+| `table_inspect_start` | Launch a localhost, read-only web UI to browse tables and jobs; returns a URL |
+| `table_inspect_stop` | Shut down the inspector web UI |
 
 ## Example conversation
 
@@ -89,6 +91,22 @@ Then invoke `/process_table` in Antigravity, e.g.:
 
 ```
 /process_table summarize each row of the reviews table into reviews_summary
+```
+
+## Inspecting your data in a browser
+
+Ask the agent to "inspect my tables" and it calls `table_inspect_start`, which
+launches a small localhost web UI (`inspect_server.py`, stdlib-only) and hands
+you a URL. You can page through every row of any table, and **job tables get a
+dedicated view**: a status summary (pending/claimed/done/failed + a `complete`
+flag) with a filterable, per-task drill-down showing each task's error and
+result. The server binds `127.0.0.1` and opens the database **read-only**, so
+browsing can never mutate your session data; `table_inspect_stop` shuts it down.
+
+Copy the workflow in for a one-command entry point:
+
+```bash
+cp workflows/inspect.md /path/to/your/project/.agent/workflows/
 ```
 
 ## Architecture
