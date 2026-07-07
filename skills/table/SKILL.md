@@ -45,7 +45,7 @@ Use the `table_job_*` tools when a table's rows each need an LLM task performed 
 
 1. Call `table_job_create` with the source `table`, a `template` containing `{column}` placeholders (e.g. `"Summarize this review: {review_text}"`), and a `job_table` name. The job table is a snapshot copy of the source rows plus a `result` column and task bookkeeping.
 2. Call `table_job_status`. If `complete` is true, stop and report the `done` and `failed` counts.
-3. Otherwise spawn `min(pending, 5)` worker subagents **in parallel**. Assemble each worker's prompt from the three-part frame below: the opening and closing are verbatim (substitute only the job table name); the execution slot in the middle is yours to fill.
+3. Otherwise dispatch `min(pending, 5)` workers as described below. Dispatch each worker as its **own background (asynchronous) subagent**, so that each worker's result comes back to you individually as it finishes — do not launch them as one blocking "run these N in parallel" batch if your harness offers a non-blocking form. Assemble each worker's prompt from the three-part frame below: the opening and closing are verbatim (substitute only the job table name); the execution slot in the middle is yours to fill.
 
    **Opening (verbatim):**
 
@@ -63,15 +63,21 @@ Use the `table_job_*` tools when a table's rows each need an LLM task performed 
 
    **Why the frame is fixed:** one task per worker means every row is processed in a fresh context. A worker that loops back to claim again drags all previous rows' work along in its context, degrading each successive answer (context rot). The server enforces this too — by default a job refuses a second claim from the same worker. Never rewrite the frame into a loop.
 
-4. When the wave finishes, go back to step 2.
+4. **Replenishment — keep ~5 workers in flight:** track the number of workers in flight yourself: +1 when you dispatch one, −1 when its result returns to you. Whenever one or more worker results arrive, call `table_job_status` once and then:
+   - If `complete` is true, stop and report the `done` and `failed` counts.
+   - If `pending > 0`, dispatch `min(pending, 5 − in_flight)` **fresh** worker subagents, each built from the full three-part frame. A replacement is always a brand-new subagent — never send a finished worker back to claim again, and never tell one worker to process multiple rows; "keep 5 in flight" means five concurrent one-task workers.
+   - If `pending` is 0 but `complete` is false, every remaining task is claimed. Dispatch nothing. If workers are still in flight, wait for their results. If none are in flight, the claims belong to dead workers whose leases (default 600s) have not yet expired — wait, then call `table_job_status` again (the status call itself requeues expired leases) and dispatch from the new `pending` count. Never spawn "just in case" against claimed tasks.
 
-**Rules:** never read or enumerate the source rows yourself — only the status counts decide when you are done. Never call `table_job_claim` yourself to check progress — a claim consumes a real task; `table_job_status` is the only progress signal. Rows whose task ends `failed` have `_task_error` set in the job table; report the failed count and let the user decide whether to retry them.
+   **If your harness can only run subagents as a blocking parallel batch** (all results return together), follow the same procedure treating the batch's return as all of its completions arriving at once: call `table_job_status`, top back up to `min(pending, 5)`, repeat. That degrades to wave-at-a-time dispatch — slower, but equally correct.
+
+**Rules:** never read or enumerate the source rows yourself — only the status counts decide when you are done. Never call `table_job_claim` yourself to check progress — a claim consumes a real task; `table_job_status` is the only progress signal. Only `pending`, never `claimed`, feeds the spawn count. Rows whose task ends `failed` have `_task_error` set in the job table; report the failed count and let the user decide whether to retry them.
 
 ### How the queue protects completeness
 
 - A worker that dies mid-task just delays its row: the claim lease (default 600s) expires and the task is requeued automatically on the next claim or status call.
 - A task that keeps failing is retried up to `max_attempts` (default 3), then marked `failed` with its error — never silently dropped.
 - Duplicate or stale submits are rejected; finished work cannot be overwritten.
+- Claims are atomic, so a replacement worker dispatched while another worker is still running simply claims a *different* pending task — or a null task, in which case it stops immediately. Rolling replenishment can over-spawn a worker but can never double-process a row.
 - By default each worker may claim only one task (`max_claims_per_worker`, default 1): every row is processed in a fresh agent context, so quality does not degrade as a job progresses. A capped worker's extra claim returns a null task with a `reason` — distinct from a drained queue, but the response is the same: the worker stops. Set `max_claims_per_worker: 0` only when one agent is intentionally meant to drain the whole queue.
 - The job table persists in the session database, so an interrupted job can be resumed later by simply running the status/spawn loop again.
 
