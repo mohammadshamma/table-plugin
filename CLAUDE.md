@@ -26,6 +26,8 @@ python3 -m unittest test_table_tool.TestClassName.test_name -v
 uv run server.py
 ```
 
+`DEVELOPMENT.md` is the contributor-facing guide (local test loop, symlinking a checkout into `$HOME/.gemini/config/plugins/table` to test inside Antigravity) — keep it in sync when commands or the install flow change.
+
 ## Architecture
 
 ```

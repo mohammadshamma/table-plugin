@@ -164,8 +164,13 @@ Run the test suites:
 ```bash
 uv run test_session_scoping.py         # server + session-scoped routing
 uv run test_table_jobs.py              # table_job_* work-queue tools
+uv run test_csv_import.py              # CSV type inference + import wiring
+uv run test_inspect.py                 # inspector lifecycle + web-UI rendering
 python3 -m unittest test_table_tool -v # table_tool CLI (pure stdlib)
 ```
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for the full development guide,
+including how to test a local checkout inside Antigravity.
 
 ## Troubleshooting
 
