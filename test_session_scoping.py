@@ -53,6 +53,12 @@ class SessionScopingTestBase(unittest.TestCase):
         self.env_patcher = patch.dict(os.environ, {}, clear=True)
         self.env_patcher.start()
 
+        # Lineage is cached process-wide by conversation_id. Each test gets a
+        # fresh brain dir, so an entry carried over from an earlier test would
+        # route this test's conversation to a stale root.
+        with server.LINEAGE_CACHE_LOCK:
+            server.LINEAGE_CACHE.clear()
+
     def tearDown(self):
         self.brain_patcher.stop()
         self.scratch_patcher.stop()

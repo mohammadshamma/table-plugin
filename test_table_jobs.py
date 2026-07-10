@@ -35,13 +35,6 @@ BOOKKEEPING_COLUMNS = {
 
 
 class TableJobsTestBase(SessionScopingTestBase):
-    def setUp(self):
-        super().setUp()
-        # The per-process claim counter must not leak between tests, which
-        # each simulate a fresh worker/orchestrator world.
-        with server.WORKER_CLAIM_COUNTS_LOCK:
-            server.WORKER_CLAIM_COUNTS.clear()
-
     def make_source(self, rows=None, columns=None, table="items"):
         columns = columns or {"name": "TEXT", "score": "INTEGER"}
         self.call_tool_sync("table_create", {"table": table, "columns": columns})
@@ -249,7 +242,7 @@ class TestJobClaim(TableJobsTestBase):
             "template": "Do {name}",
             "job_table": "items_job",
             "lease_seconds": 0,
-            "max_claims_per_worker": 0,  # both claims come from this one test process
+            "max_claims_per_worker": 0,  # cap disabled; this test reclaims after a lapsed lease
         })
         self.call_tool_sync("table_job_claim", {"conversation_id": "worker-1", "job_table": "items_job"})
         res = self.call_tool_sync("table_job_claim", {"conversation_id": "worker-2", "job_table": "items_job"})
@@ -487,11 +480,15 @@ class TestJobSessionScoping(TableJobsTestBase):
 
 
 class TestWorkerClaimCap(TableJobsTestBase):
-    """max_claims_per_worker: default 1, enforced by an in-process counter.
+    """max_claims_per_worker: default 1, a durable per-worker lifetime cap.
 
     Jobs here are created via raw call_tool_sync (not create_job) where the
     default matters, because the helper pins max_claims_per_worker=0 for the
     legacy multi-claim tests.
+
+    Most of these drive several DISTINCT worker identities against ONE queue in
+    ONE process (see cap_setup): the world a per-process counter mis-handles,
+    and the one real worker subagents actually run in.
     """
 
     def raw_create(self, **overrides):
@@ -503,30 +500,124 @@ class TestWorkerClaimCap(TableJobsTestBase):
         }
         return self.call_tool_sync("table_job_create", args)
 
-    def test_default_cap_blocks_second_claim_with_reason(self):
-        self.make_source(rows=[{"name": "a", "score": 1}, {"name": "b", "score": 2}])
-        res = self.raw_create()
-        self.assertEqual(res["max_claims_per_worker"], 1)
+    ROOT = "root-cap"
 
-        first = self.claim()
+    def cap_setup(self, rows, workers, **overrides):
+        """One queue, one server process, several distinct worker identities.
+
+        Distinct conversation_ids only share a database when lineage resolves
+        them to a common root, so every worker needs a transcript naming it a
+        child of ROOT. This is the world the production bug lived in.
+        """
+        self.write_mock_transcript(self.ROOT, "creator")
+        for w in workers:
+            self.write_mock_transcript(self.ROOT, w)
+        self.call_tool_sync("table_create", {
+            "conversation_id": "creator",
+            "table": "items",
+            "columns": {"name": "TEXT", "score": "INTEGER"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": "creator", "table": "items", "rows": rows,
+        })
+        args = {
+            "conversation_id": "creator",
+            "table": "items",
+            "template": "Summarize {name} with score {score}",
+            "job_table": "items_job",
+            **overrides,
+        }
+        return self.call_tool_sync("table_job_create", args)
+
+    def w_claim(self, worker, **overrides):
+        return self.call_tool_sync("table_job_claim", {
+            "conversation_id": worker, "job_table": "items_job", **overrides,
+        })
+
+    def w_submit(self, worker, task_id, **overrides):
+        return self.call_tool_sync("table_job_submit", {
+            "conversation_id": worker, "job_table": "items_job",
+            "task_id": task_id, **overrides,
+        })
+
+    def w_status(self):
+        return self.call_tool_sync("table_job_status", {
+            "conversation_id": "creator", "job_table": "items_job",
+        })
+
+    def root_job_rows(self):
+        db = self.brain_dir / self.ROOT / ".tables" / "session.db"
+        conn = self.db_conn(db)
+        try:
+            return [dict(r) for r in conn.execute('SELECT rowid AS task_id, * FROM "items_job"')]
+        finally:
+            conn.close()
+
+    def test_distinct_workers_one_process_each_claim_one_and_drain(self):
+        """The cap is per worker, not per job: N workers drain N tasks.
+
+        Worker subagents share one MCP server process, so a cap tracked per
+        process wedges the whole job after the first claim.
+        """
+        workers = [f"worker-{i}" for i in range(5)]
+        rows = [{"name": f"n{i}", "score": i} for i in range(5)]
+        self.assertEqual(self.cap_setup(rows, workers)["max_claims_per_worker"], 1)
+
+        for w in workers:
+            res = self.w_claim(w)
+            self.assertIsNotNone(res["task"], f"{w} was wrongly refused: {res.get('reason')}")
+            self.assertIn("last claim", res["note"])
+            self.w_submit(w, res["task"]["task_id"], result=f"done-{w}")
+
+        st = self.w_status()
+        self.assertTrue(st["complete"])
+        self.assertEqual(st["done"], 5)
+        self.assertEqual(
+            sorted(r["_task_claimed_by"] for r in self.root_job_rows()), sorted(workers)
+        )
+
+    def test_default_cap_blocks_a_workers_second_claim_but_not_a_fresh_worker(self):
+        rows = [{"name": "a", "score": 1}, {"name": "b", "score": 2}]
+        self.assertEqual(self.cap_setup(rows, ["w1", "w2"])["max_claims_per_worker"], 1)
+
+        first = self.w_claim("w1")
         self.assertIsNotNone(first["task"])
         self.assertIn("last claim", first["note"])
         self.assertIn("terminate", first["note"])
 
-        second = self.claim()
+        second = self.w_claim("w1")
         self.assertIsNone(second["task"])
         self.assertIn("claim limit", second["reason"])
+        self.assertIn("w1", second["reason"])
         self.assertEqual(second["claim_limit"], 1)
         self.assertNotIn("remaining_pending", second)
 
         # The refusal never touched the database.
-        statuses = sorted(r["_task_status"] for r in self.job_rows())
+        statuses = sorted(r["_task_status"] for r in self.root_job_rows())
         self.assertEqual(statuses, ["claimed", "pending"])
 
-        # A fresh worker process (fresh counter) can claim the remaining task.
-        with server.WORKER_CLAIM_COUNTS_LOCK:
-            server.WORKER_CLAIM_COUNTS.clear()
-        self.assertIsNotNone(self.claim()["task"])
+        # A distinct worker, in this same process, still claims the leftover.
+        self.assertIsNotNone(self.w_claim("w2")["task"])
+
+    def test_submit_does_not_free_a_slot(self):
+        """The cap counts a worker's lifetime claims, not its open ones."""
+        rows = [{"name": "a", "score": 1}, {"name": "b", "score": 2}]
+        self.cap_setup(rows, ["w1"])
+        task = self.w_claim("w1")["task"]
+        self.assertEqual(self.w_submit("w1", task["task_id"], result="ok")["accepted"], True)
+
+        # The done row is still stamped w1, so w1 has spent its one claim.
+        refused = self.w_claim("w1")
+        self.assertIsNone(refused["task"])
+        self.assertIn("claim limit", refused["reason"])
+
+    def test_cap_requires_a_worker_identity(self):
+        """A NULL stamp matches no row, so an unidentifiable worker is refused."""
+        self.make_source(rows=[{"name": "a", "score": 1}])
+        self.raw_create()  # default cap 1
+        res = self.claim()  # no conversation_id, and the env is cleared
+        self.assertIn("conversation_id", res.get("error", ""))
+        self.assertEqual(self.job_rows()[0]["_task_status"], "pending")
 
     def test_cap_zero_is_unlimited(self):
         self.make_source(rows=[{"name": f"n{i}", "score": i} for i in range(5)])
@@ -539,18 +630,18 @@ class TestWorkerClaimCap(TableJobsTestBase):
         self.assertEqual(drained, {"task": None, "remaining_pending": 0})
 
     def test_cap_n_allows_n_then_refuses(self):
-        self.make_source(rows=[{"name": f"n{i}", "score": i} for i in range(3)])
-        self.raw_create(max_claims_per_worker=2)
+        rows = [{"name": f"n{i}", "score": i} for i in range(3)]
+        self.cap_setup(rows, ["w1"], max_claims_per_worker=2)
 
-        first = self.claim()
+        first = self.w_claim("w1")
         self.assertEqual(first["note"], "Claim 1 of 2 allowed for this worker.")
-        second = self.claim()
+        second = self.w_claim("w1")
         self.assertIn("last claim", second["note"])
 
-        third = self.claim()
+        third = self.w_claim("w1")
         self.assertIsNone(third["task"])
         self.assertEqual(third["claim_limit"], 2)
-        self.assertEqual(sum(r["_task_status"] == "pending" for r in self.job_rows()), 1)
+        self.assertEqual(sum(r["_task_status"] == "pending" for r in self.root_job_rows()), 1)
 
     def test_legacy_null_cap_is_unlimited(self):
         self.make_source(rows=[{"name": "a", "score": 1}, {"name": "b", "score": 2}])
@@ -618,61 +709,80 @@ class TestWorkerClaimCap(TableJobsTestBase):
         self.assertEqual(res.get("ok"), True)
         self.assertEqual(res["max_claims_per_worker"], 1)
 
-    def test_counter_resets_when_job_recreated(self):
-        self.make_source(rows=[{"name": "a", "score": 1}])
-        self.raw_create()
-        task = self.claim()["task"]
-        self.submit(task["task_id"], result="done")
+    def test_recreated_job_resets_per_worker_counts(self):
+        self.cap_setup([{"name": "a", "score": 1}], ["w1"])
+        task = self.w_claim("w1")["task"]
+        self.w_submit("w1", task["task_id"], result="done")
+        self.assertIsNone(self.w_claim("w1")["task"])  # w1 has spent its claim
 
-        # Deregister + drop, then re-create the same job name: the new job
-        # must not inherit the old namesake's claim count.
-        conn = self.db_conn()
+        # Deregister + drop, then re-create the same job name: the rebuilt job
+        # table carries no stamps, so the old namesake's counts do not persist.
+        db = self.brain_dir / self.ROOT / ".tables" / "session.db"
+        conn = self.db_conn(db)
         try:
             conn.execute(f'DELETE FROM "{server.JOBS_TABLE}" WHERE job_table = ?', ("items_job",))
             conn.commit()
         finally:
             conn.close()
-        self.call_tool_sync("table_drop", {"table": "items_job"})
+        self.call_tool_sync("table_drop", {"conversation_id": "creator", "table": "items_job"})
+        self.call_tool_sync("table_job_create", {
+            "conversation_id": "creator", "table": "items",
+            "template": "Summarize {name} with score {score}", "job_table": "items_job",
+        })
 
-        self.raw_create()
-        self.assertIsNotNone(self.claim()["task"])
+        self.assertIsNotNone(self.w_claim("w1")["task"])
 
     def test_capped_refusal_does_not_sweep_or_write(self):
-        self.make_source(rows=[{"name": "a", "score": 1}])
-        self.raw_create(lease_seconds=0)
-        self.claim()  # lease expires instantly
+        self.cap_setup([{"name": "a", "score": 1}], ["w1"], lease_seconds=0)
+        self.w_claim("w1")  # lease expires instantly
 
-        refused = self.claim()
+        refused = self.w_claim("w1")
         self.assertIsNone(refused["task"])
         self.assertIn("reason", refused)
-        # The refusal ran no lease sweep: the row is still marked claimed.
-        self.assertEqual(self.job_rows()[0]["_task_status"], "claimed")
+        # The cap is checked before the sweep, so the refusal ran none: the row
+        # is still marked claimed.
+        self.assertEqual(self.root_job_rows()[0]["_task_status"], "claimed")
         # Normal recovery is untouched: status sweeps it back to pending.
-        self.assertEqual(self.status()["pending"], 1)
+        self.assertEqual(self.w_status()["pending"], 1)
 
-    def test_concurrent_claims_respect_cap(self):
-        self.make_source(rows=[{"name": f"n{i}", "score": i} for i in range(10)])
-        self.raw_create()  # default cap 1, shared by both threads (one process)
-
+    def _concurrent_claims(self, worker_ids):
         results = []
         lock = threading.Lock()
 
-        def worker():
-            res = server.dispatch("table_job_claim", {"job_table": "items_job"})
+        def worker(conversation_id):
+            res = server.dispatch("table_job_claim", {
+                "conversation_id": conversation_id, "job_table": "items_job",
+            })
             with lock:
                 results.append(res)
 
-        threads = [threading.Thread(target=worker) for _ in range(2)]
+        threads = [threading.Thread(target=worker, args=(w,)) for w in worker_ids]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+        return results
 
+    def test_concurrent_claims_by_one_worker_respect_cap(self):
+        rows = [{"name": f"n{i}", "score": i} for i in range(10)]
+        self.cap_setup(rows, ["solo"])  # default cap 1
+
+        results = self._concurrent_claims(["solo", "solo"])
         tasks = [r for r in results if r["task"] is not None]
         refusals = [r for r in results if r["task"] is None]
         self.assertEqual(len(tasks), 1)
         self.assertEqual(len(refusals), 1)
         self.assertIn("claim limit", refusals[0]["reason"])
+
+    def test_concurrent_claims_by_distinct_workers_all_succeed(self):
+        """Two workers racing in one process each get their own task."""
+        rows = [{"name": f"n{i}", "score": i} for i in range(4)]
+        self.cap_setup(rows, ["cw0", "cw1"])  # default cap 1
+
+        results = self._concurrent_claims(["cw0", "cw1"])
+        tasks = [r["task"] for r in results if r["task"] is not None]
+        self.assertEqual(len(tasks), 2, f"a worker was wrongly refused: {results}")
+        self.assertEqual(len({t["task_id"] for t in tasks}), 2)
 
     def test_invalid_max_claims_per_worker(self):
         self.make_source(rows=[{"name": "a", "score": 1}])

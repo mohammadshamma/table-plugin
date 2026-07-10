@@ -566,20 +566,21 @@ TOOLS = [
 JOBS_TABLE = table_tool.JOBS_TABLE
 RESERVED_TASK_COLUMNS = table_tool.RESERVED_TASK_COLUMNS
 
-# Claims made by THIS process, keyed by (resolved db path, job_table). The
-# `max_claims_per_worker` cap cannot key on _task_claimed_by (every worker
-# passes the parent conversation's id), but each worker subagent runs its own
-# server process, so an in-process counter is a per-worker counter. Same
-# module-level dict + lock idiom as LINEAGE_CACHE.
-WORKER_CLAIM_COUNTS: dict = {}
-WORKER_CLAIM_COUNTS_LOCK = threading.Lock()
+# The `max_claims_per_worker` cap is enforced durably in SQL, inside the claim's
+# own BEGIN IMMEDIATE transaction: a worker's claim count is the number of rows
+# already stamped with its conversation_id in _task_claimed_by. Worker subagents
+# may share one server process or run separate ones; a SQL count holds either
+# way, and survives a server restart. A capped claim that cannot identify its
+# worker is refused, because a NULL stamp matches no row and would silently go
+# uncounted.
 
 
 def job_connect(db: str) -> sqlite3.Connection:
     """Connection with explicit transaction control for atomic claims.
 
-    Worker subagents may each run their own server process against the shared
-    db, so job operations use BEGIN IMMEDIATE and need a busy timeout.
+    Worker subagents race for the same db, from threads of one server process or
+    from separate processes, so job operations use BEGIN IMMEDIATE and need a
+    busy timeout.
     """
     conn = table_tool.connect(db)
     conn.isolation_level = None
@@ -732,11 +733,9 @@ def op_job_create(db: str, args: dict) -> dict:
             conn.execute("ROLLBACK")
             raise table_tool.TableToolError(f"SQLite error: {e}") from e
 
-        # A job name can be re-registered after manual deregistration; the new
-        # job must not inherit claim counts from an older namesake.
-        with WORKER_CLAIM_COUNTS_LOCK:
-            WORKER_CLAIM_COUNTS.pop((db, job_table), None)
-
+        # A job name can be re-registered after manual deregistration without
+        # inheriting an older namesake's claim counts: the rebuilt job table
+        # carries no _task_claimed_by stamps.
         return {
             "ok": True,
             "job_table": job_table,
@@ -756,81 +755,86 @@ def op_job_claim(db: str, args: dict) -> dict:
         job_table = job["job_table"]
 
         # Per-worker claim cap. NULL (job predates the cap) and 0 both mean
-        # unlimited. Refusal happens before the transaction: a capped worker
-        # does no DB work at all, and its null task is structurally distinct
-        # from a drained queue (reason/claim_limit vs remaining_pending).
+        # unlimited.
         cap_raw = job.get("max_claims_per_worker")
         cap = int(cap_raw) if cap_raw else 0
-        counter_key = (db, job_table)
-        if cap:
-            with WORKER_CLAIM_COUNTS_LOCK:
-                made = WORKER_CLAIM_COUNTS.get(counter_key, 0)
+        if cap and worker_id is None:
+            raise table_tool.TableToolError(
+                "table_job_claim needs a worker identity when max_claims_per_worker "
+                "is set: pass conversation_id (or set ANTIGRAVITY_CONVERSATION_ID). "
+                "Use max_claims_per_worker=0 to let one unidentified worker drain "
+                "the whole queue."
+            )
+
+        made = 0
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # The cap is a worker's lifetime claim count: rows it has stamped,
+            # counted inside the same transaction that stamps the next one.
+            # Checked before the sweep and before task selection, so a capped
+            # worker writes nothing, and its null task stays structurally
+            # distinct from a drained queue (reason/claim_limit vs
+            # remaining_pending) even when the queue happens to be empty.
+            if cap:
+                made = conn.execute(
+                    f'SELECT COUNT(*) FROM "{job_table}" WHERE _task_claimed_by = ?',
+                    (worker_id,),
+                ).fetchone()[0]
                 if made >= cap:
+                    conn.execute("ROLLBACK")
                     return {
                         "task": None,
                         "reason": (
-                            f"worker claim limit reached ({cap} per worker) — submit any "
+                            f"worker claim limit reached: worker {worker_id} has already "
+                            f"claimed {made} task(s) (limit {cap} per worker) — submit any "
                             "outstanding result, then terminate; fresh workers will "
                             "continue this job"
                         ),
                         "claim_limit": cap,
                     }
-                # Reserve the slot; released below if no task is actually
-                # claimed. Never hold the lock across SQLite I/O.
-                WORKER_CLAIM_COUNTS[counter_key] = made + 1
 
-        claimed = False
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                sweep_expired_leases(conn, job)
-                row = conn.execute(
-                    f'SELECT rowid AS _task_id, * FROM "{job_table}" '
-                    "WHERE _task_status = 'pending' ORDER BY rowid LIMIT 1"
-                ).fetchone()
-                if row is None:
-                    conn.execute("COMMIT")
-                    return {"task": None, "remaining_pending": 0}
-
-                task_id = row["_task_id"]
-                conn.execute(
-                    f'UPDATE "{job_table}" SET '
-                    "  _task_status = 'claimed', "
-                    "  _task_attempts = _task_attempts + 1, "
-                    "  _task_lease_expires = ?, "
-                    "  _task_claimed_by = ? "
-                    "WHERE rowid = ?",
-                    (time.time() + job["lease_seconds"], worker_id, task_id),
-                )
-                remaining = conn.execute(
-                    f'SELECT COUNT(*) FROM "{job_table}" WHERE _task_status = \'pending\''
-                ).fetchone()[0]
+            sweep_expired_leases(conn, job)
+            row = conn.execute(
+                f'SELECT rowid AS _task_id, * FROM "{job_table}" '
+                "WHERE _task_status = 'pending' ORDER BY rowid LIMIT 1"
+            ).fetchone()
+            if row is None:
                 conn.execute("COMMIT")
-            except sqlite3.Error as e:
-                conn.execute("ROLLBACK")
-                raise table_tool.TableToolError(f"SQLite error: {e}") from e
-            claimed = True
-        finally:
-            if cap and not claimed:
-                with WORKER_CLAIM_COUNTS_LOCK:
-                    WORKER_CLAIM_COUNTS[counter_key] -= 1
+                return {"task": None, "remaining_pending": 0}
+
+            task_id = row["_task_id"]
+            conn.execute(
+                f'UPDATE "{job_table}" SET '
+                "  _task_status = 'claimed', "
+                "  _task_attempts = _task_attempts + 1, "
+                "  _task_lease_expires = ?, "
+                "  _task_claimed_by = ? "
+                "WHERE rowid = ?",
+                (time.time() + job["lease_seconds"], worker_id, task_id),
+            )
+            remaining = conn.execute(
+                f'SELECT COUNT(*) FROM "{job_table}" WHERE _task_status = \'pending\''
+            ).fetchone()[0]
+            conn.execute("COMMIT")
+        except sqlite3.Error as e:
+            conn.execute("ROLLBACK")
+            raise table_tool.TableToolError(f"SQLite error: {e}") from e
 
         row_values = {
             k: v for k, v in dict(row).items()
             if k != "_task_id" and k not in RESERVED_TASK_COLUMNS
         }
         try:
-            # A render failure keeps the reserved slot: the claim is already
-            # committed (it also consumed a _task_attempts); the lease sweep
-            # recovers the task.
+            # A render failure still spends this worker's claim: the stamp and
+            # the _task_attempts bump are already committed. The lease sweep
+            # recovers the task for someone else.
             prompt = job["template"].format(**row_values)
         except Exception as e:
             raise table_tool.TableToolError(f"Failed to render template for task {task_id}: {e}") from e
 
         result = {"task": {"task_id": task_id, "prompt": prompt}, "remaining_pending": remaining}
         if cap:
-            with WORKER_CLAIM_COUNTS_LOCK:
-                made = WORKER_CLAIM_COUNTS.get(counter_key, 0)
+            made += 1  # this claim stamped one more row for this worker
             if made >= cap:
                 result["note"] = (
                     f"This is your last claim for this job (limit {cap} per worker). "
