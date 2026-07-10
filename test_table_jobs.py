@@ -717,22 +717,47 @@ class TestWorkerClaimCap(TableJobsTestBase):
         self.w_submit("w1", task["task_id"], result="done")
         self.assertIsNone(self.w_claim("w1")["task"])  # w1 has spent its claim
 
-        # Deregister + drop, then re-create the same job name: the rebuilt job
-        # table carries no stamps, so the old namesake's counts do not persist.
-        db = self.brain_dir / self.ROOT / ".tables" / "session.db"
-        conn = self.db_conn(db)
-        try:
-            conn.execute(f'DELETE FROM "{server.JOBS_TABLE}" WHERE job_table = ?', ("items_job",))
-            conn.commit()
-        finally:
-            conn.close()
-        self.call_tool_sync("table_drop", {"conversation_id": "creator", "table": "items_job"})
-        self.call_tool_sync("table_job_create", {
+        # Dropping the job table deregisters it, so the name is reusable. The
+        # rebuilt table carries no stamps, so the namesake's counts do not persist.
+        dropped = self.call_tool_sync("table_drop", {
+            "conversation_id": "creator", "table": "items_job",
+        })
+        self.assertEqual(dropped["deregistered"], True)
+        recreated = self.call_tool_sync("table_job_create", {
             "conversation_id": "creator", "table": "items",
             "template": "Summarize {name} with score {score}", "job_table": "items_job",
         })
+        self.assertEqual(recreated["ok"], True)
 
         self.assertIsNotNone(self.w_claim("w1")["task"])
+
+    def test_dropping_a_job_table_frees_its_name(self):
+        """The cycle a real agent could not complete: drop, then re-create."""
+        self.cap_setup([{"name": "a", "score": 1}], ["w1"])
+
+        # Without deregistration this fails with "already registered", and the
+        # registry cannot be edited through table_run_sql — the name is burned.
+        self.call_tool_sync("table_drop", {"conversation_id": "creator", "table": "items_job"})
+        again = self.call_tool_sync("table_job_create", {
+            "conversation_id": "creator", "table": "items",
+            "template": "Summarize {name} with score {score}", "job_table": "items_job",
+        })
+        self.assertEqual(again.get("ok"), True, again)
+        self.assertEqual(again["total_tasks"], 1)
+
+    def test_dropping_an_ordinary_table_leaves_the_registry_alone(self):
+        self.cap_setup([{"name": "a", "score": 1}], ["w1"])
+        dropped = self.call_tool_sync("table_drop", {"conversation_id": "creator", "table": "items"})
+        self.assertNotIn("deregistered", dropped)
+
+        conn = self.db_conn(self.root_db())
+        try:
+            still = conn.execute(
+                f'SELECT COUNT(*) FROM "{server.JOBS_TABLE}" WHERE job_table = ?', ("items_job",)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(still, 1)
 
     def test_capped_refusal_does_not_sweep_or_write(self):
         self.cap_setup([{"name": "a", "score": 1}], ["w1"], lease_seconds=0)

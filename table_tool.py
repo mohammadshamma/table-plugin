@@ -501,14 +501,28 @@ def op_tables(db: str) -> dict:
 
 
 def op_drop(db: str, table: str) -> dict:
-    """Drop a table."""
+    """Drop a table, deregistering it first if it is a job table.
+
+    A registration outlives its table otherwise, and table_job_create refuses a
+    name that is still registered — burning it for good, since the registry is
+    not writable through table_run_sql.
+    """
     if not table or not table.strip():
         raise TableToolError("Table name cannot be empty")
     conn = connect(db)
     try:
+        try:
+            deregistered = conn.execute(
+                f'DELETE FROM "{JOBS_TABLE}" WHERE job_table = ?', (table,)
+            ).rowcount
+        except sqlite3.OperationalError:
+            deregistered = 0  # registry table absent → no jobs were ever created
         conn.execute(f'DROP TABLE IF EXISTS "{table}"')
         conn.commit()
-        return {"ok": True, "dropped": table}
+        result = {"ok": True, "dropped": table}
+        if deregistered:
+            result["deregistered"] = True
+        return result
     except sqlite3.Error as e:
         raise TableToolError(f"SQLite error: {e}") from e
     finally:
