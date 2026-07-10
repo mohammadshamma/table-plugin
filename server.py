@@ -13,6 +13,7 @@ Imports table_tool.py directly for the actual database operations.
 Run with: uv run server.py  (uv provisions Python and the mcp SDK)
 """
 
+import hashlib
 import json
 import os
 import re
@@ -51,6 +52,75 @@ def get_brain_dir() -> Path:
 def get_scratch_dir() -> Path:
     """Get the scratch directory path."""
     return Path.home() / ".gemini" / "antigravity" / "scratch"
+
+
+# ─── Build identity ──────────────────────────────────────────────────────────
+#
+# Antigravity imports this module once and keeps the process alive, so editing
+# the source (or switching branches under the install symlink) changes nothing
+# until the server restarts. LOADED_BUILD is computed at import and therefore
+# names the code THIS process is actually running; op_version re-reads the same
+# files at call time, and a mismatch means a restart is pending.
+
+PLUGIN_VERSION = "0.0.4"
+PLUGIN_DIR = Path(__file__).resolve().parent
+SOURCE_FILES = ("server.py", "table_tool.py")
+
+
+def source_build_id() -> str | None:
+    """Short digest of the plugin's importable sources, or None if unreadable."""
+    digest = hashlib.sha256()
+    try:
+        for name in SOURCE_FILES:
+            digest.update((PLUGIN_DIR / name).read_bytes())
+    except OSError:
+        return None
+    return digest.hexdigest()[:12]
+
+
+LOADED_BUILD = source_build_id()
+STARTED_AT = time.time()
+
+
+def git_revision() -> dict:
+    """HEAD and dirtiness of the install directory, or {} if it is not a checkout."""
+    def run(*argv):
+        return subprocess.run(
+            argv, cwd=PLUGIN_DIR, capture_output=True, text=True, timeout=5
+        )
+
+    try:
+        head = run("git", "rev-parse", "--short", "HEAD")
+        status = run("git", "status", "--porcelain")
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if head.returncode != 0 or status.returncode != 0:
+        return {}
+    return {"commit": head.stdout.strip(), "dirty": bool(status.stdout.strip())}
+
+
+def op_version() -> dict:
+    disk_build = source_build_id()
+    stale = None not in (disk_build, LOADED_BUILD) and disk_build != LOADED_BUILD
+    result = {
+        "version": PLUGIN_VERSION,
+        "plugin_dir": str(PLUGIN_DIR),
+        "loaded_build": LOADED_BUILD,
+        "disk_build": disk_build,
+        "stale": stale,
+        "pid": os.getpid(),
+        "started_at": STARTED_AT,
+    }
+    revision = git_revision()
+    if revision:
+        result["git"] = revision
+    if stale:
+        result["note"] = (
+            "The plugin source on disk has changed since this server process "
+            "imported it. Restart Antigravity to load it; until then every tool "
+            "call runs the older code."
+        )
+    return result
 
 
 def find_parent_conversation(child_id: str, brain_dir: Path) -> str | None:
@@ -340,6 +410,17 @@ TOOLS = [
                 "into": {"description": "If set, save results into this new table", "type": "string"},
             },
             "required": ["table", "by", "aggs"],
+        },
+    ),
+    types.Tool(
+        name="table_version",
+        description="Report which build of the table plugin this server process is running. 'loaded_build' is the code in memory; 'disk_build' is the source on disk right now. If 'stale' is true they differ, and Antigravity must be restarted before edits to the plugin take effect.",
+        inputSchema={
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "additionalProperties": False,
+            "type": "object",
+            "properties": {},
+            "required": [],
         },
     ),
     types.Tool(
@@ -1082,6 +1163,11 @@ def op_inspect_stop(db: str, args: dict) -> dict:
 
 
 def dispatch(name: str, args: dict) -> dict:
+    # Answered before the database is resolved: a version check must not create
+    # a session db, and must work even when path resolution would fail.
+    if name == "table_version":
+        return op_version()
+
     db_path = get_resolved_db_path(args)
 
     if name == "table_create":
@@ -1145,7 +1231,7 @@ def dispatch(name: str, args: dict) -> dict:
         raise ValueError(f"Unknown tool: {name}")
 
 
-server = Server("table", version="0.0.4")
+server = Server("table", version=PLUGIN_VERSION)
 
 
 @server.list_tools()

@@ -14,6 +14,7 @@ You have access to database tools via the `table` MCP server. Use these tools to
 - **table_join** — Join two tables into a new table (inner, left, or cross join).
 - **table_group_by** — Group rows with aggregation functions (COUNT, SUM, AVG, etc.). Optionally save results to a new table.
 - **table_run_sql** — Execute arbitrary SQL for anything not covered by the structured tools. Job tables and the `_table_jobs` registry are read-only through it.
+- **table_version** — Report which build of the plugin this server process is running. `stale: true` means the source on disk has changed since the server imported it, and Antigravity must be restarted for the change to take effect.
 - **table_schema** — Inspect table columns and types.
 - **table_list** — List all tables in a database.
 - **table_drop** — Delete a table.

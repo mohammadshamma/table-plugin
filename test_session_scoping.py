@@ -1417,5 +1417,47 @@ class TestSessionScopingTier4(SessionScopingTestBase):
             }))
 
 
+class TestVersionTool(SessionScopingTestBase):
+    """table_version reports the build this process imported, not the one on disk.
+
+    Antigravity keeps the server process alive, so a source edit takes effect
+    only after a restart. The tool exists to make that gap visible.
+    """
+
+    def test_version_is_declared_as_a_tool(self):
+        self.assertIn("table_version", {t.name for t in server.TOOLS})
+
+    def test_reports_a_matching_build_when_nothing_changed(self):
+        res = self.call_tool_sync("table_version", {})
+        self.assertEqual(res["version"], server.PLUGIN_VERSION)
+        self.assertEqual(res["loaded_build"], res["disk_build"])
+        self.assertFalse(res["stale"])
+        self.assertNotIn("note", res)
+        self.assertEqual(res["pid"], os.getpid())
+        self.assertEqual(res["plugin_dir"], str(server.PLUGIN_DIR))
+
+    def test_reports_stale_when_the_source_changed_since_import(self):
+        with patch.object(server, "LOADED_BUILD", "0ldbu1ld0000"):
+            res = self.call_tool_sync("table_version", {})
+        self.assertTrue(res["stale"])
+        self.assertNotEqual(res["loaded_build"], res["disk_build"])
+        self.assertIn("Restart Antigravity", res["note"])
+
+    def test_does_not_resolve_or_create_a_database(self):
+        # dispatch answers before get_resolved_db_path, so a version check must
+        # not leave a session.db behind, even with no conversation_id.
+        self.call_tool_sync("table_version", {})
+        self.assertFalse((self.cwd_dir / "session.db").exists())
+        self.assertFalse((self.scratch_dir / "session.db").exists())
+
+    def test_build_id_is_none_when_sources_are_unreadable(self):
+        with patch.object(server, "PLUGIN_DIR", self.brain_dir / "does-not-exist"):
+            self.assertIsNone(server.source_build_id())
+
+    def test_git_revision_absent_outside_a_checkout(self):
+        with patch.object(server, "PLUGIN_DIR", self.brain_dir):
+            self.assertEqual(server.git_revision(), {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
