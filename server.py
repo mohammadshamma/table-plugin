@@ -13,6 +13,7 @@ Imports table_tool.py directly for the actual database operations.
 Run with: uv run server.py  (uv provisions Python and the mcp SDK)
 """
 
+import hashlib
 import json
 import os
 import re
@@ -51,6 +52,75 @@ def get_brain_dir() -> Path:
 def get_scratch_dir() -> Path:
     """Get the scratch directory path."""
     return Path.home() / ".gemini" / "antigravity" / "scratch"
+
+
+# ─── Build identity ──────────────────────────────────────────────────────────
+#
+# Antigravity imports this module once and keeps the process alive, so editing
+# the source (or switching branches under the install symlink) changes nothing
+# until the server restarts. LOADED_BUILD is computed at import and therefore
+# names the code THIS process is actually running; op_version re-reads the same
+# files at call time, and a mismatch means a restart is pending.
+
+PLUGIN_VERSION = "0.0.4"
+PLUGIN_DIR = Path(__file__).resolve().parent
+SOURCE_FILES = ("server.py", "table_tool.py")
+
+
+def source_build_id() -> str | None:
+    """Short digest of the plugin's importable sources, or None if unreadable."""
+    digest = hashlib.sha256()
+    try:
+        for name in SOURCE_FILES:
+            digest.update((PLUGIN_DIR / name).read_bytes())
+    except OSError:
+        return None
+    return digest.hexdigest()[:12]
+
+
+LOADED_BUILD = source_build_id()
+STARTED_AT = time.time()
+
+
+def git_revision() -> dict:
+    """HEAD and dirtiness of the install directory, or {} if it is not a checkout."""
+    def run(*argv):
+        return subprocess.run(
+            argv, cwd=PLUGIN_DIR, capture_output=True, text=True, timeout=5
+        )
+
+    try:
+        head = run("git", "rev-parse", "--short", "HEAD")
+        status = run("git", "status", "--porcelain")
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if head.returncode != 0 or status.returncode != 0:
+        return {}
+    return {"commit": head.stdout.strip(), "dirty": bool(status.stdout.strip())}
+
+
+def op_version() -> dict:
+    disk_build = source_build_id()
+    stale = None not in (disk_build, LOADED_BUILD) and disk_build != LOADED_BUILD
+    result = {
+        "version": PLUGIN_VERSION,
+        "plugin_dir": str(PLUGIN_DIR),
+        "loaded_build": LOADED_BUILD,
+        "disk_build": disk_build,
+        "stale": stale,
+        "pid": os.getpid(),
+        "started_at": STARTED_AT,
+    }
+    revision = git_revision()
+    if revision:
+        result["git"] = revision
+    if stale:
+        result["note"] = (
+            "The plugin source on disk has changed since this server process "
+            "imported it. Restart Antigravity to load it; until then every tool "
+            "call runs the older code."
+        )
+    return result
 
 
 def find_parent_conversation(child_id: str, brain_dir: Path) -> str | None:
@@ -343,8 +413,19 @@ TOOLS = [
         },
     ),
     types.Tool(
+        name="table_version",
+        description="Report which build of the table plugin this server process is running. 'loaded_build' is the code in memory; 'disk_build' is the source on disk right now. If 'stale' is true they differ, and Antigravity must be restarted before edits to the plugin take effect.",
+        inputSchema={
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "additionalProperties": False,
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    ),
+    types.Tool(
         name="table_run_sql",
-        description="Run an arbitrary SQL query and return results as JSON. Use for SELECT, UPDATE, DELETE, or any SQL not covered by other tools.",
+        description="Run an arbitrary SQL query and return results as JSON. Use for SELECT, UPDATE, DELETE, or any SQL not covered by other tools. Job tables and the _table_jobs registry are read-only here: their task bookkeeping is owned by the table_job_* tools.",
         inputSchema={
             "$schema": "http://json-schema.org/draft-07/schema#",
             "additionalProperties": False,
@@ -566,20 +647,21 @@ TOOLS = [
 JOBS_TABLE = table_tool.JOBS_TABLE
 RESERVED_TASK_COLUMNS = table_tool.RESERVED_TASK_COLUMNS
 
-# Claims made by THIS process, keyed by (resolved db path, job_table). The
-# `max_claims_per_worker` cap cannot key on _task_claimed_by (every worker
-# passes the parent conversation's id), but each worker subagent runs its own
-# server process, so an in-process counter is a per-worker counter. Same
-# module-level dict + lock idiom as LINEAGE_CACHE.
-WORKER_CLAIM_COUNTS: dict = {}
-WORKER_CLAIM_COUNTS_LOCK = threading.Lock()
+# The `max_claims_per_worker` cap is enforced durably in SQL, inside the claim's
+# own BEGIN IMMEDIATE transaction: a worker's claim count is the number of rows
+# already stamped with its conversation_id in _task_claimed_by. Worker subagents
+# may share one server process or run separate ones; a SQL count holds either
+# way, and survives a server restart. A capped claim that cannot identify its
+# worker is refused, because a NULL stamp matches no row and would silently go
+# uncounted.
 
 
 def job_connect(db: str) -> sqlite3.Connection:
     """Connection with explicit transaction control for atomic claims.
 
-    Worker subagents may each run their own server process against the shared
-    db, so job operations use BEGIN IMMEDIATE and need a busy timeout.
+    Worker subagents race for the same db, from threads of one server process or
+    from separate processes, so job operations use BEGIN IMMEDIATE and need a
+    busy timeout.
     """
     conn = table_tool.connect(db)
     conn.isolation_level = None
@@ -732,11 +814,9 @@ def op_job_create(db: str, args: dict) -> dict:
             conn.execute("ROLLBACK")
             raise table_tool.TableToolError(f"SQLite error: {e}") from e
 
-        # A job name can be re-registered after manual deregistration; the new
-        # job must not inherit claim counts from an older namesake.
-        with WORKER_CLAIM_COUNTS_LOCK:
-            WORKER_CLAIM_COUNTS.pop((db, job_table), None)
-
+        # A job name can be re-registered after manual deregistration without
+        # inheriting an older namesake's claim counts: the rebuilt job table
+        # carries no _task_claimed_by stamps.
         return {
             "ok": True,
             "job_table": job_table,
@@ -756,81 +836,86 @@ def op_job_claim(db: str, args: dict) -> dict:
         job_table = job["job_table"]
 
         # Per-worker claim cap. NULL (job predates the cap) and 0 both mean
-        # unlimited. Refusal happens before the transaction: a capped worker
-        # does no DB work at all, and its null task is structurally distinct
-        # from a drained queue (reason/claim_limit vs remaining_pending).
+        # unlimited.
         cap_raw = job.get("max_claims_per_worker")
         cap = int(cap_raw) if cap_raw else 0
-        counter_key = (db, job_table)
-        if cap:
-            with WORKER_CLAIM_COUNTS_LOCK:
-                made = WORKER_CLAIM_COUNTS.get(counter_key, 0)
+        if cap and worker_id is None:
+            raise table_tool.TableToolError(
+                "table_job_claim needs a worker identity when max_claims_per_worker "
+                "is set: pass conversation_id (or set ANTIGRAVITY_CONVERSATION_ID). "
+                "Use max_claims_per_worker=0 to let one unidentified worker drain "
+                "the whole queue."
+            )
+
+        made = 0
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # The cap is a worker's lifetime claim count: rows it has stamped,
+            # counted inside the same transaction that stamps the next one.
+            # Checked before the sweep and before task selection, so a capped
+            # worker writes nothing, and its null task stays structurally
+            # distinct from a drained queue (reason/claim_limit vs
+            # remaining_pending) even when the queue happens to be empty.
+            if cap:
+                made = conn.execute(
+                    f'SELECT COUNT(*) FROM "{job_table}" WHERE _task_claimed_by = ?',
+                    (worker_id,),
+                ).fetchone()[0]
                 if made >= cap:
+                    conn.execute("ROLLBACK")
                     return {
                         "task": None,
                         "reason": (
-                            f"worker claim limit reached ({cap} per worker) — submit any "
+                            f"worker claim limit reached: worker {worker_id} has already "
+                            f"claimed {made} task(s) (limit {cap} per worker) — submit any "
                             "outstanding result, then terminate; fresh workers will "
                             "continue this job"
                         ),
                         "claim_limit": cap,
                     }
-                # Reserve the slot; released below if no task is actually
-                # claimed. Never hold the lock across SQLite I/O.
-                WORKER_CLAIM_COUNTS[counter_key] = made + 1
 
-        claimed = False
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                sweep_expired_leases(conn, job)
-                row = conn.execute(
-                    f'SELECT rowid AS _task_id, * FROM "{job_table}" '
-                    "WHERE _task_status = 'pending' ORDER BY rowid LIMIT 1"
-                ).fetchone()
-                if row is None:
-                    conn.execute("COMMIT")
-                    return {"task": None, "remaining_pending": 0}
-
-                task_id = row["_task_id"]
-                conn.execute(
-                    f'UPDATE "{job_table}" SET '
-                    "  _task_status = 'claimed', "
-                    "  _task_attempts = _task_attempts + 1, "
-                    "  _task_lease_expires = ?, "
-                    "  _task_claimed_by = ? "
-                    "WHERE rowid = ?",
-                    (time.time() + job["lease_seconds"], worker_id, task_id),
-                )
-                remaining = conn.execute(
-                    f'SELECT COUNT(*) FROM "{job_table}" WHERE _task_status = \'pending\''
-                ).fetchone()[0]
+            sweep_expired_leases(conn, job)
+            row = conn.execute(
+                f'SELECT rowid AS _task_id, * FROM "{job_table}" '
+                "WHERE _task_status = 'pending' ORDER BY rowid LIMIT 1"
+            ).fetchone()
+            if row is None:
                 conn.execute("COMMIT")
-            except sqlite3.Error as e:
-                conn.execute("ROLLBACK")
-                raise table_tool.TableToolError(f"SQLite error: {e}") from e
-            claimed = True
-        finally:
-            if cap and not claimed:
-                with WORKER_CLAIM_COUNTS_LOCK:
-                    WORKER_CLAIM_COUNTS[counter_key] -= 1
+                return {"task": None, "remaining_pending": 0}
+
+            task_id = row["_task_id"]
+            conn.execute(
+                f'UPDATE "{job_table}" SET '
+                "  _task_status = 'claimed', "
+                "  _task_attempts = _task_attempts + 1, "
+                "  _task_lease_expires = ?, "
+                "  _task_claimed_by = ? "
+                "WHERE rowid = ?",
+                (time.time() + job["lease_seconds"], worker_id, task_id),
+            )
+            remaining = conn.execute(
+                f'SELECT COUNT(*) FROM "{job_table}" WHERE _task_status = \'pending\''
+            ).fetchone()[0]
+            conn.execute("COMMIT")
+        except sqlite3.Error as e:
+            conn.execute("ROLLBACK")
+            raise table_tool.TableToolError(f"SQLite error: {e}") from e
 
         row_values = {
             k: v for k, v in dict(row).items()
             if k != "_task_id" and k not in RESERVED_TASK_COLUMNS
         }
         try:
-            # A render failure keeps the reserved slot: the claim is already
-            # committed (it also consumed a _task_attempts); the lease sweep
-            # recovers the task.
+            # A render failure still spends this worker's claim: the stamp and
+            # the _task_attempts bump are already committed. The lease sweep
+            # recovers the task for someone else.
             prompt = job["template"].format(**row_values)
         except Exception as e:
             raise table_tool.TableToolError(f"Failed to render template for task {task_id}: {e}") from e
 
         result = {"task": {"task_id": task_id, "prompt": prompt}, "remaining_pending": remaining}
         if cap:
-            with WORKER_CLAIM_COUNTS_LOCK:
-                made = WORKER_CLAIM_COUNTS.get(counter_key, 0)
+            made += 1  # this claim stamped one more row for this worker
             if made >= cap:
                 result["note"] = (
                     f"This is your last claim for this job (limit {cap} per worker). "
@@ -1078,6 +1163,11 @@ def op_inspect_stop(db: str, args: dict) -> dict:
 
 
 def dispatch(name: str, args: dict) -> dict:
+    # Answered before the database is resolved: a version check must not create
+    # a session db, and must work even when path resolution would fail.
+    if name == "table_version":
+        return op_version()
+
     db_path = get_resolved_db_path(args)
 
     if name == "table_create":
@@ -1141,7 +1231,7 @@ def dispatch(name: str, args: dict) -> dict:
         raise ValueError(f"Unknown tool: {name}")
 
 
-server = Server("table", version="0.0.4")
+server = Server("table", version=PLUGIN_VERSION)
 
 
 @server.list_tools()
