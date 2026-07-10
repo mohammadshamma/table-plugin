@@ -443,11 +443,19 @@ def op_group(db: str, table: str, spec: dict) -> dict:
 
 
 def op_query(db: str, sql: str) -> dict:
-    """Run arbitrary SQL and return results as JSON."""
+    """Run arbitrary SQL and return results as JSON.
+
+    Reads are unrestricted. Writes to the job registry and to a job table's
+    task bookkeeping are refused, so a job's guarantees cannot be dismantled
+    through this tool; see QueueGuard.
+    """
     if not sql or not sql.strip():
         raise TableToolError("SQL query cannot be empty")
     conn = connect(db)
+    guard = None
     try:
+        guard = QueueGuard(protected_tables(conn))
+        conn.set_authorizer(guard)
         cursor = conn.execute(sql)
         if cursor.description:
             rows = [dict(r) for r in cursor.fetchall()]
@@ -456,6 +464,8 @@ def op_query(db: str, sql: str) -> dict:
             conn.commit()
             return {"ok": True, "changes": conn.total_changes}
     except sqlite3.Error as e:
+        if guard is not None and guard.denied:
+            raise guard.error() from e
         raise TableToolError(f"SQLite error: {e}") from e
     finally:
         conn.close()
@@ -559,6 +569,75 @@ def list_job_tables(conn: sqlite3.Connection) -> list:
     except sqlite3.OperationalError:
         return []  # registry table absent → no jobs
     return [r["job_table"] for r in rows]
+
+
+def protected_tables(conn: sqlite3.Connection) -> set:
+    """The registry plus every currently-registered job table.
+
+    Registration is read at call time, so deregistering a job (deleting its
+    registry row) releases the protection on its table.
+    """
+    return {JOBS_TABLE, *list_job_tables(conn)}
+
+
+class QueueGuard:
+    """SQLite authorizer denying writes to job-queue bookkeeping.
+
+    A job's guarantees — atomic claims, the per-worker cap, lease requeue, the
+    attempt limit, "finished work is never overwritten" — hold only while task
+    state moves through the table_job_* tools. Arbitrary SQL could rewrite that
+    state, or the registry that governs it, so op_query runs behind this guard.
+
+    The authorizer fires at statement-prepare time with the table and column an
+    action targets, so no SQL parsing is involved. It denies writes and leaves
+    every read alone. Source columns of a job table stay writable: they are the
+    caller's own data.
+    """
+
+    def __init__(self, protected: set):
+        self.protected = protected
+        self.denied = None  # (table, detail) of the first refusal, for the error
+
+    def _deny(self, table: str, detail: str = "") -> int:
+        self.denied = (table, detail)
+        return sqlite3.SQLITE_DENY
+
+    def __call__(self, action, arg1, arg2, db_name, trigger) -> int:
+        if action == sqlite3.SQLITE_UPDATE:
+            if arg1 == JOBS_TABLE:
+                return self._deny(arg1, f"column {arg2}")
+            if arg1 in self.protected and arg2 in RESERVED_TASK_COLUMNS:
+                return self._deny(arg1, f"task bookkeeping column {arg2}")
+        elif action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE):
+            if arg1 in self.protected:
+                return self._deny(arg1)
+        elif action == sqlite3.SQLITE_DROP_TABLE:
+            if arg1 in self.protected:
+                return self._deny(arg1)
+        elif action == sqlite3.SQLITE_ALTER_TABLE:
+            # Here arg1 is the schema name and arg2 the table.
+            if arg2 in self.protected:
+                return self._deny(arg2)
+        elif action == sqlite3.SQLITE_CREATE_TRIGGER:
+            # A trigger on a protected table would write it on the caller's
+            # behalf, from a statement that never names the columns.
+            if arg2 in self.protected:
+                return self._deny(arg2, f"trigger {arg1}")
+        elif action == sqlite3.SQLITE_PRAGMA:
+            # SQLite already refuses sqlite_master writes unless this is on.
+            if arg1 == "writable_schema":
+                return self._deny("sqlite_master", "PRAGMA writable_schema")
+        return sqlite3.SQLITE_OK
+
+    def error(self) -> "TableToolError":
+        table, detail = self.denied
+        where = f" ({detail})" if detail else ""
+        return TableToolError(
+            f"table_run_sql cannot modify the job queue's bookkeeping: "
+            f"'{table}'{where} is managed by the table_job_* tools. Read it freely "
+            f"with SELECT; change task state with table_job_claim/table_job_submit. "
+            f"If the queue is misbehaving, that is a bug to report, not to work around."
+        )
 
 
 # ─── CLI Commands ────────────────────────────────────────────────────────────

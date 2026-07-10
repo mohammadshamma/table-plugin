@@ -344,7 +344,7 @@ TOOLS = [
     ),
     types.Tool(
         name="table_run_sql",
-        description="Run an arbitrary SQL query and return results as JSON. Use for SELECT, UPDATE, DELETE, or any SQL not covered by other tools.",
+        description="Run an arbitrary SQL query and return results as JSON. Use for SELECT, UPDATE, DELETE, or any SQL not covered by other tools. Job tables and the _table_jobs registry are read-only here: their task bookkeeping is owned by the table_job_* tools.",
         inputSchema={
             "$schema": "http://json-schema.org/draft-07/schema#",
             "additionalProperties": False,

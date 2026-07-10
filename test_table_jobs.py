@@ -87,6 +87,61 @@ class TableJobsTestBase(SessionScopingTestBase):
         finally:
             conn.close()
 
+    # ─── One queue, one process, several distinct worker identities ──────────
+    #
+    # Distinct conversation_ids only share a database when lineage resolves them
+    # to a common root, so every worker needs a transcript naming it a child of
+    # ROOT. This is the world worker subagents actually run in.
+
+    ROOT = "root-cap"
+
+    def cap_setup(self, rows, workers, **overrides):
+        self.write_mock_transcript(self.ROOT, "creator")
+        for w in workers:
+            self.write_mock_transcript(self.ROOT, w)
+        self.call_tool_sync("table_create", {
+            "conversation_id": "creator",
+            "table": "items",
+            "columns": {"name": "TEXT", "score": "INTEGER"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": "creator", "table": "items", "rows": rows,
+        })
+        args = {
+            "conversation_id": "creator",
+            "table": "items",
+            "template": "Summarize {name} with score {score}",
+            "job_table": "items_job",
+            **overrides,
+        }
+        return self.call_tool_sync("table_job_create", args)
+
+    def w_claim(self, worker, **overrides):
+        return self.call_tool_sync("table_job_claim", {
+            "conversation_id": worker, "job_table": "items_job", **overrides,
+        })
+
+    def w_submit(self, worker, task_id, **overrides):
+        return self.call_tool_sync("table_job_submit", {
+            "conversation_id": worker, "job_table": "items_job",
+            "task_id": task_id, **overrides,
+        })
+
+    def w_status(self):
+        return self.call_tool_sync("table_job_status", {
+            "conversation_id": "creator", "job_table": "items_job",
+        })
+
+    def root_db(self):
+        return self.brain_dir / self.ROOT / ".tables" / "session.db"
+
+    def root_job_rows(self):
+        conn = self.db_conn(self.root_db())
+        try:
+            return [dict(r) for r in conn.execute('SELECT rowid AS task_id, * FROM "items_job"')]
+        finally:
+            conn.close()
+
 
 class TestJobCreate(TableJobsTestBase):
     def test_create_copies_all_rows_as_pending(self):
@@ -500,59 +555,6 @@ class TestWorkerClaimCap(TableJobsTestBase):
         }
         return self.call_tool_sync("table_job_create", args)
 
-    ROOT = "root-cap"
-
-    def cap_setup(self, rows, workers, **overrides):
-        """One queue, one server process, several distinct worker identities.
-
-        Distinct conversation_ids only share a database when lineage resolves
-        them to a common root, so every worker needs a transcript naming it a
-        child of ROOT. This is the world the production bug lived in.
-        """
-        self.write_mock_transcript(self.ROOT, "creator")
-        for w in workers:
-            self.write_mock_transcript(self.ROOT, w)
-        self.call_tool_sync("table_create", {
-            "conversation_id": "creator",
-            "table": "items",
-            "columns": {"name": "TEXT", "score": "INTEGER"},
-        })
-        self.call_tool_sync("table_insert", {
-            "conversation_id": "creator", "table": "items", "rows": rows,
-        })
-        args = {
-            "conversation_id": "creator",
-            "table": "items",
-            "template": "Summarize {name} with score {score}",
-            "job_table": "items_job",
-            **overrides,
-        }
-        return self.call_tool_sync("table_job_create", args)
-
-    def w_claim(self, worker, **overrides):
-        return self.call_tool_sync("table_job_claim", {
-            "conversation_id": worker, "job_table": "items_job", **overrides,
-        })
-
-    def w_submit(self, worker, task_id, **overrides):
-        return self.call_tool_sync("table_job_submit", {
-            "conversation_id": worker, "job_table": "items_job",
-            "task_id": task_id, **overrides,
-        })
-
-    def w_status(self):
-        return self.call_tool_sync("table_job_status", {
-            "conversation_id": "creator", "job_table": "items_job",
-        })
-
-    def root_job_rows(self):
-        db = self.brain_dir / self.ROOT / ".tables" / "session.db"
-        conn = self.db_conn(db)
-        try:
-            return [dict(r) for r in conn.execute('SELECT rowid AS task_id, * FROM "items_job"')]
-        finally:
-            conn.close()
-
     def test_distinct_workers_one_process_each_claim_one_and_drain(self):
         """The cap is per worker, not per job: N workers drain N tasks.
 
@@ -788,6 +790,122 @@ class TestWorkerClaimCap(TableJobsTestBase):
         self.make_source(rows=[{"name": "a", "score": 1}])
         res = self.raw_create(max_claims_per_worker=-1)
         self.assertIn("max_claims_per_worker", res.get("error", ""))
+
+
+class TestRunSqlQueueGuard(TableJobsTestBase):
+    """table_run_sql must not be able to rewrite a job's bookkeeping.
+
+    A job's guarantees hold only while task state moves through the table_job_*
+    tools. Arbitrary SQL could otherwise forge task results, or disable the
+    per-worker cap in the registry, without ever touching the DB file.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.cap_setup([{"name": "a", "score": 1}, {"name": "b", "score": 2}], ["w1", "w2"])
+
+    def sql(self, statement):
+        return self.call_tool_sync("table_run_sql", {
+            "conversation_id": "creator", "sql": statement,
+        })
+
+    def assertDenied(self, statement):
+        res = self.sql(statement)
+        err = res.get("error", "")
+        self.assertIn("cannot modify the job queue", err, f"not denied: {statement!r} -> {res}")
+        return err
+
+    def registry_cap(self):
+        conn = self.db_conn(self.root_db())
+        try:
+            return conn.execute(
+                f'SELECT max_claims_per_worker FROM "{server.JOBS_TABLE}" WHERE job_table = ?',
+                ("items_job",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_cannot_disable_the_claim_cap(self):
+        """The exact bypass an agent used against the real server."""
+        err = self.assertDenied(
+            "UPDATE _table_jobs SET max_claims_per_worker = 0 WHERE job_table = 'items_job';"
+        )
+        self.assertIn("_table_jobs", err)
+        self.assertIn("table_job_", err)  # the refusal names the sanctioned tools
+        self.assertEqual(self.registry_cap(), 1)
+
+    def test_cannot_forge_task_state(self):
+        task = self.w_claim("w1")["task"]
+        self.assertDenied("UPDATE items_job SET _task_status = 'done'")
+        self.assertDenied("UPDATE items_job SET result = 'forged'")
+        self.assertDenied("UPDATE items_job SET _task_attempts = 0")
+        self.assertDenied("UPDATE items_job SET _task_claimed_by = 'someone-else'")
+
+        row = next(r for r in self.root_job_rows() if r["task_id"] == task["task_id"])
+        self.assertEqual(row["_task_status"], "claimed")
+        self.assertEqual(row["_task_claimed_by"], "w1")
+        self.assertIsNone(row["result"])
+
+    def test_cannot_add_remove_or_reshape_queue_tables(self):
+        for statement in (
+            "INSERT INTO items_job (name, score, _task_status, _task_attempts) VALUES ('z', 9, 'pending', 0)",
+            "DELETE FROM items_job",
+            "DELETE FROM _table_jobs",
+            "INSERT INTO _table_jobs (job_table) VALUES ('fake')",
+            "DROP TABLE items_job",
+            "DROP TABLE _table_jobs",
+            "ALTER TABLE items_job RENAME TO stolen",
+            "CREATE TRIGGER t AFTER INSERT ON items_job BEGIN SELECT 1; END",
+            "PRAGMA writable_schema=ON",
+        ):
+            self.assertDenied(statement)
+
+        self.assertEqual(len(self.root_job_rows()), 2)
+        self.assertEqual(self.registry_cap(), 1)
+
+    def test_reads_and_ordinary_writes_still_work(self):
+        self.assertEqual(self.sql("SELECT * FROM items_job")["count"], 2)
+        self.assertEqual(self.sql(f'SELECT * FROM "{server.JOBS_TABLE}"')["count"], 1)
+
+        # A job table's SOURCE columns are the caller's own data.
+        self.assertEqual(self.sql("UPDATE items_job SET name = 'renamed'")["changes"], 2)
+        self.assertTrue(all(r["name"] == "renamed" for r in self.root_job_rows()))
+
+        # Ordinary tables are untouched by the guard.
+        self.call_tool_sync("table_create", {
+            "conversation_id": "creator", "table": "plain", "columns": {"x": "INTEGER"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": "creator", "table": "plain", "rows": [{"x": 1}],
+        })
+        self.assertEqual(self.sql("UPDATE plain SET x = 2")["changes"], 1)
+        self.assertEqual(self.sql("ALTER TABLE plain ADD COLUMN y INTEGER")["ok"], True)
+        self.assertEqual(self.sql("DROP TABLE plain")["ok"], True)
+
+    def test_guard_does_not_leak_into_the_job_tools(self):
+        """The table_job_* tools write _task_* freely; only run_sql is guarded."""
+        task = self.w_claim("w1")["task"]
+        self.assertEqual(self.w_submit("w1", task["task_id"], result="ok")["accepted"], True)
+        task2 = self.w_claim("w2")["task"]
+        # An error requeues the task (attempt 1 of 3), which also writes _task_*.
+        self.assertEqual(self.w_submit("w2", task2["task_id"], error="boom")["accepted"], True)
+
+        st = self.w_status()
+        self.assertEqual((st["done"], st["pending"]), (1, 1))
+        rows = {r["task_id"]: r for r in self.root_job_rows()}
+        self.assertEqual(rows[task["task_id"]]["result"], "ok")
+        self.assertEqual(rows[task2["task_id"]]["_task_error"], "boom")
+
+    def test_deregistering_a_job_releases_protection(self):
+        conn = self.db_conn(self.root_db())
+        try:
+            conn.execute(f'DELETE FROM "{server.JOBS_TABLE}" WHERE job_table = ?', ("items_job",))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # No longer a registered job table, so it is ordinary data again.
+        self.assertEqual(self.sql("DELETE FROM items_job")["changes"], 2)
 
 
 if __name__ == "__main__":
