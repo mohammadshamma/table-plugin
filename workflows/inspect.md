@@ -18,8 +18,13 @@ paste table rows into your context.
    points at the same session database as your other table tools).
 
 3. Call `table_inspect_start`. Pass `port` only if the user asked for a specific
-   one. The tool is idempotent — if an inspector is already running it just returns
-   the existing URL (`already_running: true`); do not try to start a second one.
+   one — it must be 1024–65535 (a request like "port 80" errors; relay that), and
+   the server binds the first *free* port at or above it, so the bound port can
+   differ from the request — always report the returned `url`. The tool is
+   idempotent — if an inspector is already running it just returns the existing
+   URL (`already_running: true`); do not try to start a second one. If start
+   returns an error (the spawned server exited or never became healthy within
+   ~8s), relay it to the user instead of handing over a URL.
 
 4. Give the user the returned `url` and tell them to open it in a browser. Mention
    that they can browse every table's rows (paginated, and sortable by clicking any
@@ -35,3 +40,9 @@ paste table rows into your context.
 the data, and its `claimed` counts may lag a live `table_job_status` call because it
 does not requeue expired leases. It shows whatever is in the session database right
 now; you don't need to pre-load or summarize anything for it.
+
+The inspector self-exits after 30 minutes with no requests — but each page's
+auto-refresh counts as a request, so an open browser tab holds it alive
+indefinitely, while a closed tab lets it die on its own. If the user comes back
+to a stale or dead URL, that's not a bug: just call `table_inspect_start` again
+(it reuses a live instance or clears the stale pidfile and starts fresh).
