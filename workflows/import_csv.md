@@ -8,8 +8,8 @@ Follow these steps exactly. The `table_import_csv` MCP tool does all the work se
 
 1. Determine from the user's request:
    - **file path** — the CSV file to import; must be a local file (expand `~` to an absolute path)
-   - **table name** — where the data goes (default: the CSV filename stem, lowercased, e.g. `~/data/Sales.csv` → `sales`)
-   - **delimiter** — only if the user indicated a non-comma format (e.g. `;` or tab)
+   - **table name** — where the data goes (default: the CSV filename stem, lowercased, e.g. `~/data/Sales.csv` → `sales`); must not contain a double-quote character — strip/replace any `"` when deriving it from a filename (spaces and dashes are fine)
+   - **delimiter** — only if the user indicated a non-comma format (e.g. `;` or tab); must be exactly one character (default `,`) — for tab-separated files pass a literal tab character, not the word "tab" or the two-character string `\t`
 
    Ask the user for anything you cannot determine.
 
