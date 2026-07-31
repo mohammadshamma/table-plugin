@@ -21,6 +21,18 @@ A typical workflow looks like this:
 
 The [job queue](#job-processing-run-a-task-over-every-row) takes this pattern further: instead of one subagent loading a table, a pool of parallel subagents processes every row of one, with durable bookkeeping that guarantees no row is skipped, dropped, or double-processed.
 
+### How subagents share one database
+
+Every tool (except `table_version`) takes an optional `conversation_id`
+argument, falling back to the `ANTIGRAVITY_CONVERSATION_ID` environment
+variable. The server traces the parent→child conversation lineage back to the
+**root** session and stores the database at
+`<brain>/<root_id>/.tables/session.db` — so a main agent and all of its
+subagents, however deeply nested, resolve to the same file. If a subagent
+can't see a table, the usual cause is a missing `conversation_id`: without
+one, the server falls back to a shared scratch database instead of the
+session's.
+
 ## Prerequisites
 
 - **[uv](https://docs.astral.sh/uv/)** — that's it. uv provisions Python and the
@@ -45,7 +57,7 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 | `table_insert` | Insert rows from a list |
 | `table_join` | Join two tables into a new table (inner/left/cross) |
 | `table_group_by` | Group by with aggregations, optionally save to a new table |
-| `table_run_sql` | Execute arbitrary SQL |
+| `table_run_sql` | Execute arbitrary SQL (job tables' task bookkeeping and the job registry are read-only here — see below) |
 | `table_schema` | Inspect table columns and types |
 | `table_list` | List all tables in a database |
 | `table_drop` | Drop a table |
@@ -56,6 +68,19 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 | `table_job_status` | Task counts and a `complete` flag |
 | `table_inspect_start` | Launch a localhost, read-only web UI to browse tables and jobs; returns a URL |
 | `table_inspect_stop` | Shut down the inspector web UI |
+| `table_version` | Report the running plugin build; `stale: true` means the code on disk has changed and Antigravity needs a restart |
+
+`table_version` takes no parameters: it compares a digest of `server.py` +
+`table_tool.py` frozen at import against the same files on disk, so a `stale`
+result means the server process is still running pre-edit code.
+
+`table_run_sql` runs behind a SQLite authorizer that keeps the job queue's
+guarantees intact: the `_table_jobs` registry and a job table's reserved
+bookkeeping columns (`result`, `_task_status`, `_task_error`, `_task_attempts`,
+`_task_lease_expires`, `_task_claimed_by`) cannot be written, and
+`INSERT`/`DELETE`/`DROP`/`ALTER`/`CREATE TRIGGER` on protected tables — plus
+`PRAGMA writable_schema` — are denied. Task state only moves through the
+`table_job_*` tools.
 
 ## Example conversation
 
@@ -70,6 +95,22 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 ```
 
 Antigravity agents will automatically use the table tools to execute these operations.
+
+## Importing a CSV
+
+`table_import_csv` loads a CSV file into a new table entirely server-side —
+column names come from the header row, and INTEGER/REAL/TEXT column types are
+inferred deterministically from the data — so the file's contents never enter
+the model's context. Copy the bundled workflow in for a one-command entry
+point:
+
+```bash
+cp workflows/import_csv.md /path/to/your/project/.agent/workflows/
+```
+
+Then invoke `/import_csv` in Antigravity: it resolves the file path and table
+name from your request, runs the import, and reports the row count and
+inferred schema.
 
 ## Job processing: run a task over every row
 
@@ -137,6 +178,12 @@ dedicated view**: a status summary (pending/claimed/done/failed + a `complete`
 flag) with a filterable, per-task drill-down showing each task's error and
 result. The server binds `127.0.0.1` and opens the database **read-only**, so
 browsing can never mutate your session data; `table_inspect_stop` shuts it down.
+
+You don't have to remember to stop it, though: the inspector self-exits after
+30 minutes of inactivity. Each page auto-refreshes, which keeps the idle timer
+fresh — so an open tab holds the server alive, and a closed one lets it wind
+down on its own. `table_inspect_start` is also idempotent: calling it again
+reuses the running instance rather than starting a second one.
 
 Copy the workflow in for a one-command entry point:
 
