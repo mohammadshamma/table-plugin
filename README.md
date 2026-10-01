@@ -2,6 +2,8 @@
 
 An Antigravity plugin that gives agents database capabilities through structured tools — including a **durable job queue** that fans a templated task out over every row of a table using parallel subagents.
 
+> This repository is a read-only mirror, published automatically from the maintainer's development repo. Issues are welcome; pull requests are applied upstream and then appear here.
+
 ## Why this exists
 
 LLMs struggle with structured data. Ask one to compare 50 rows across three columns and you'll see numbers transposed, rows dropped, and calculations quietly drift — a problem commonly known as **context rot**. The more data the model juggles inside its context window, the worse it gets.
