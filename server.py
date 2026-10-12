@@ -1,8 +1,8 @@
 #!/usr/bin/env -S uv run
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = [
-#     "mcp==1.28.1",
+#     "mcp==1.30.0",
 # ]
 # ///
 """
@@ -1101,7 +1101,7 @@ def op_inspect_start(db: str, args: dict) -> dict:
 
     # Run the (stdlib-only) inspector with this server's own interpreter rather
     # than `uv run`: sys.executable is guaranteed to exist and satisfy the
-    # >=3.10 requirement, with no PATH lookup, uv resolution, or network access.
+    # >=3.11 requirement, with no PATH lookup, uv resolution, or network access.
     # Detached so it survives this stdio server; DEVNULL so it never writes to
     # the MCP stdout stream (which would corrupt the JSON-RPC protocol).
     proc = subprocess.Popen(

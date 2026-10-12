@@ -8,7 +8,7 @@ An Antigravity plugin that gives agents SQLite database capabilities via an MCP 
 
 ## Commands
 
-There is no build step, package manager config, or lock file — `server.py` and the uv-run tests are PEP 723 single-file scripts (`uv run` provisions Python ≥3.10 and the pinned `mcp==1.28.1` automatically).
+There is no build step, package manager config, or lock file — `server.py` and the uv-run tests are PEP 723 single-file scripts (`uv run` provisions Python ≥3.11 and the pinned `mcp==1.30.0` automatically).
 
 ```bash
 # Run the test suites

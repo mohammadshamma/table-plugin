@@ -1,8 +1,8 @@
 #!/usr/bin/env -S uv run
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = [
-#     "mcp==1.28.1",
+#     "mcp==1.30.0",
 #     "anyio",
 # ]
 # ///
