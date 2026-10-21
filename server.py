@@ -666,6 +666,10 @@ def job_connect(db: str) -> sqlite3.Connection:
     conn = table_tool.connect(db)
     conn.isolation_level = None
     conn.execute("PRAGMA busy_timeout=10000")
+    # The job tools write the bookkeeping, so they cannot run behind
+    # QueueGuard; instead no trigger may fire on their behalf (see
+    # table_tool.no_trigger_authorizer).
+    conn.set_authorizer(table_tool.no_trigger_authorizer)
     return conn
 
 

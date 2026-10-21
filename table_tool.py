@@ -642,6 +642,21 @@ def _fold(name) -> str:
     return (name or "").translate(_ASCII_FOLD)
 
 
+def no_trigger_authorizer(action, arg1, arg2, db_name, trigger) -> int:
+    """SQLite authorizer for the table_job_* tools' own connections.
+
+    Those connections must write the bookkeeping, so QueueGuard cannot run on
+    them. But nothing they write may legitimately carry a trigger, so any
+    action requested from inside a trigger body is refused. This stops a
+    trigger that reached a queue table by a route QueueGuard cannot see (such
+    as ALTER TABLE ... RENAME of a prepared table onto the registry's name
+    before the first job exists) from rewriting task state unguarded.
+    """
+    if trigger is not None:
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
 class QueueGuard:
     """SQLite authorizer denying writes to job-queue bookkeeping.
 
@@ -687,11 +702,20 @@ class QueueGuard:
         elif action in (sqlite3.SQLITE_DROP_TABLE, sqlite3.SQLITE_DROP_TEMP_TABLE):
             if self._is_protected(arg1):
                 return self._deny(arg1)
-        elif action in (sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_TEMP_TABLE):
-            # Pre-creating the registry (or a job table name) with a schema
-            # of the caller's choosing would shape the queue before any job.
+        elif action in (sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_TEMP_TABLE,
+                        sqlite3.SQLITE_CREATE_VIEW, sqlite3.SQLITE_CREATE_TEMP_VIEW):
+            # Pre-creating the registry (or a job table name) as a table or
+            # view of the caller's choosing would shape the queue before any
+            # job exists. (ALTER TABLE ... RENAME TO a protected name is not
+            # visible here — SQLite passes only the old name — which is why
+            # job_connect's connections also run behind no_trigger_authorizer.)
             if self._is_protected(arg1):
                 return self._deny(arg1)
+        elif action in (sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_CREATE_TEMP_INDEX):
+            # Here arg1 is the index and arg2 the table. A UNIQUE index on a
+            # bookkeeping column would make claims or job creation fail.
+            if self._is_protected(arg2):
+                return self._deny(arg2, f"index {arg1}")
         elif action == sqlite3.SQLITE_ALTER_TABLE:
             # Here arg1 is the schema name and arg2 the table.
             if self._is_protected(arg2):

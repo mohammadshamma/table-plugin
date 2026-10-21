@@ -1048,6 +1048,54 @@ class TestQueueGuardOnEveryWritePath(TableJobsTestBase):
                                    aggs={"n": "COUNT(*)"})["count"], 2)
 
 
+class TestRegistryCannotBePrepared(TableJobsTestBase):
+    """Before the first job, the registry name is free. A caller must not be
+    able to stand up its own registry there for the job tools to adopt."""
+
+    REGISTRY_COLS = (
+        "job_table TEXT PRIMARY KEY, source_table TEXT, template TEXT, "
+        "lease_seconds REAL, max_attempts INTEGER, max_claims_per_worker INTEGER, "
+        "created_at REAL"
+    )
+
+    def sql(self, statement):
+        return self.call_tool_sync("table_run_sql", {"sql": statement})
+
+    def test_cannot_create_registry_table_view_or_index(self):
+        for statement in (
+            f"CREATE TABLE _table_jobs ({self.REGISTRY_COLS})",
+            "CREATE VIEW _TABLE_JOBS AS SELECT 'items_job' AS job_table, 0 AS max_claims_per_worker",
+            "CREATE TEMP VIEW _table_jobs AS SELECT 1",
+        ):
+            self.assertIn("cannot modify the job queue", self.sql(statement).get("error", ""), statement)
+        self.make_source(rows=[{"name": "a", "score": 1}])
+        self.create_job()
+        res = self.sql("CREATE UNIQUE INDEX ux ON items_job(_task_status)")
+        self.assertIn("cannot modify the job queue", res.get("error", ""), res)
+
+    def test_trigger_renamed_onto_registry_cannot_fire_in_job_tools(self):
+        """CREATE fake + trigger, then RENAME it onto the registry name."""
+        self.make_source(rows=[{"name": "a", "score": 1}, {"name": "b", "score": 2}])
+        for statement in (
+            f"CREATE TABLE fake ({self.REGISTRY_COLS})",
+            "CREATE TRIGGER t AFTER INSERT ON fake BEGIN "
+            "UPDATE fake SET max_claims_per_worker = 0 WHERE job_table = NEW.job_table; END",
+            "ALTER TABLE fake RENAME TO _table_jobs",
+        ):
+            self.assertEqual(self.sql(statement).get("ok"), True, statement)
+
+        res = self.create_job(max_claims_per_worker=1)
+        self.assertIn("error", res)  # the planted trigger was refused
+        conn = self.db_conn()
+        try:
+            rows = conn.execute("SELECT max_claims_per_worker FROM _table_jobs").fetchall()
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            conn.close()
+        self.assertEqual(rows, [])  # rolled back as a whole
+        self.assertNotIn("items_job", tables)
+
+
 class TestDropDeregistersCaseInsensitively(TableJobsTestBase):
     def test_drop_with_different_case_deregisters(self):
         self.make_source(rows=[{"name": "a", "score": 1}])
