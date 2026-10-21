@@ -81,7 +81,7 @@ Use the `table_job_*` tools when a table's rows each need an LLM task performed 
 - Claims are atomic, so a replacement worker dispatched while another worker is still running simply claims a *different* pending task — or a null task, in which case it stops immediately. Rolling replenishment can over-spawn a worker but can never double-process a row.
 - By default each worker may claim only one task (`max_claims_per_worker`, default 1): every row is processed in a fresh agent context, so quality does not degrade as a job progresses. A capped worker's extra claim returns a null task with a `reason` — distinct from a drained queue, but the response is the same: the worker stops. Set `max_claims_per_worker: 0` only when one agent is intentionally meant to drain the whole queue.
 - The job table persists in the session database, so an interrupted job can be resumed later by simply running the status/spawn loop again.
-- These guarantees hold only because task state moves through the `table_job_*` tools. The job table's `_task_*` columns and the `_table_jobs` registry are therefore read-only everywhere else — `table_run_sql` refuses to write them. If the queue seems to be misbehaving, that is a bug to report, not to work around.
+- These guarantees hold only because task state moves through the `table_job_*` tools. The job table's `_task_*` columns and the `_table_jobs` registry are therefore read-only everywhere else — `table_run_sql`, `table_insert` and the other `table_*` tools refuse to write them, including through a trigger. If the queue seems to be misbehaving, that is a bug to report, not to work around.
 
 ## Browsing tables in a browser (table_inspect_* tools)
 

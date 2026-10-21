@@ -142,6 +142,22 @@ class TableToolTest(unittest.TestCase):
         tables = run("tables", str(DB))
         self.assertNotIn("user_orders", tables["tables"])
 
+    def test_09_unique_columns_are_quoted(self):
+        # A keyword or a name with a space must be quoted inside UNIQUE(...).
+        result = run(
+            "create-table",
+            str(DB),
+            "orders_u",
+            json.dumps({
+                "columns": {"order": "TEXT", "ship to": "TEXT"},
+                "unique": ["order", "ship to"],
+            }),
+        )
+        self.assertEqual(result.get("ok"), True, result)
+        run("insert", str(DB), "orders_u", json.dumps({"rows": [{"order": "a", "ship to": "x"}]}))
+        dup = run("insert", str(DB), "orders_u", json.dumps({"rows": [{"order": "a", "ship to": "y"}]}))
+        self.assertIn("UNIQUE", dup["error"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

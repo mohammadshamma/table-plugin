@@ -23,6 +23,7 @@ server.py exposes them as MCP tools without a subprocess round-trip.
 import argparse
 import csv
 import json
+import math
 import re
 import sqlite3
 import sys
@@ -41,6 +42,33 @@ def connect(db_path: str) -> sqlite3.Connection:
         return conn
     except sqlite3.Error as e:
         raise TableToolError(f"SQLite error: {e}") from e
+
+
+def guarded_connect(db_path: str, tool: str) -> tuple:
+    """connect() with QueueGuard installed, for every caller-facing write path.
+
+    The guard has to sit on every connection that runs caller-chosen writes,
+    not just table_run_sql's: a plain INSERT can target the queue tables
+    directly, and an INSERT into an ordinary table can fire a trigger whose
+    body writes them. SQLite authorizes trigger bodies when the firing
+    statement is prepared, so a planted trigger is refused here too. Returns
+    (conn, guard); callers turn a refusal into guard.error().
+    """
+    conn = connect(db_path)
+    try:
+        guard = QueueGuard(protected_tables(conn), tool)
+        conn.set_authorizer(guard)
+    except sqlite3.Error as e:
+        conn.close()
+        raise TableToolError(f"SQLite error: {e}") from e
+    return conn, guard
+
+
+def _sqlite_error(guard, e: sqlite3.Error) -> "TableToolError":
+    """The error to raise for e: the guard's refusal if it fired, else e."""
+    if guard is not None and guard.denied:
+        return guard.error()
+    return TableToolError(f"SQLite error: {e}")
 
 
 def output(data: dict | list) -> None:
@@ -102,18 +130,18 @@ def op_create_table(db: str, table: str, spec: dict) -> dict:
 
     # Unique constraints
     for ucol in spec.get("unique", []):
-        col_defs.append(f"UNIQUE({ucol})")
+        col_defs.append(f'UNIQUE("{ucol}")')
 
     exists_clause = "IF NOT EXISTS " if spec.get("if_not_exists") else ""
     sql = f'CREATE TABLE {exists_clause}"{table}" (\n  {",".join(col_defs)}\n)'
 
-    conn = connect(db)
+    conn, guard = guarded_connect(db, "table_create")
     try:
         conn.execute(sql)
         conn.commit()
         return {"ok": True, "table": table, "sql": sql}
     except sqlite3.Error as e:
-        raise TableToolError(f"SQLite error: {e}") from e
+        raise _sqlite_error(guard, e) from e
     finally:
         conn.close()
 
@@ -136,7 +164,7 @@ def op_insert(db: str, table: str, spec: dict) -> dict:
     if not rows or not isinstance(rows, list):
         raise TableToolError("'rows' is required and must be a list of objects")
 
-    conn = connect(db)
+    conn, guard = guarded_connect(db, "table_insert")
     try:
         inserted = 0
         for row in rows:
@@ -149,7 +177,7 @@ def op_insert(db: str, table: str, spec: dict) -> dict:
         return {"ok": True, "table": table, "inserted": inserted}
     except sqlite3.Error as e:
         conn.rollback()
-        raise TableToolError(f"SQLite error: {e}") from e
+        raise _sqlite_error(guard, e) from e
     finally:
         conn.close()
 
@@ -177,6 +205,8 @@ def _classify_value(value: str) -> str:
             return "TEXT"  # beyond SQLite's 64-bit INTEGER range
         return "INTEGER"
     if _REAL_RE.match(value):
+        if not math.isfinite(float(value)):
+            return "TEXT"  # "1e500" overflows to inf: not a storable REAL
         return "REAL"
     return "TEXT"
 
@@ -255,6 +285,8 @@ def op_import_csv(db: str, table: str, spec: dict) -> dict:
         raise TableToolError(f"CSV file not found: {file_path}") from e
     except UnicodeDecodeError as e:
         raise TableToolError(f"CSV file is not valid UTF-8: {file_path}") from e
+    except PermissionError as e:
+        raise TableToolError(f"CSV file is not readable (permission denied): {file_path}") from e
 
     if not all_rows or not all_rows[0]:
         raise TableToolError("CSV file is empty (no header row)")
@@ -289,7 +321,7 @@ def op_import_csv(db: str, table: str, spec: dict) -> dict:
     placeholders = ", ".join("?" for _ in header)
     insert_sql = f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders})'
 
-    conn = connect(db)
+    conn, guard = guarded_connect(db, "table_import_csv")
     try:
         # sqlite3 only auto-begins a transaction before DML, so BEGIN
         # explicitly to keep the exists check, CREATE TABLE, and inserts
@@ -312,7 +344,7 @@ def op_import_csv(db: str, table: str, spec: dict) -> dict:
         }
     except sqlite3.Error as e:
         conn.rollback()
-        raise TableToolError(f"SQLite error: {e}") from e
+        raise _sqlite_error(guard, e) from e
     except TableToolError:
         conn.rollback()
         raise
@@ -364,14 +396,14 @@ def op_join(db: str, output_table: str, spec: dict) -> dict:
     if on_clause:
         sql += f" ON {on_clause}"
 
-    conn = connect(db)
+    conn, guard = guarded_connect(db, "table_join")
     try:
         conn.execute(sql)
         conn.commit()
         count = conn.execute(f'SELECT COUNT(*) FROM "{output_table}"').fetchone()[0]
         return {"ok": True, "table": output_table, "rows": count, "sql": sql}
     except sqlite3.Error as e:
-        raise TableToolError(f"SQLite error: {e}") from e
+        raise _sqlite_error(guard, e) from e
     finally:
         conn.close()
 
@@ -421,7 +453,7 @@ def op_group(db: str, table: str, spec: dict) -> dict:
     if "limit" in spec:
         sql += f' LIMIT {int(spec["limit"])}'
 
-    conn = connect(db)
+    conn, guard = guarded_connect(db, "table_group_by")
     try:
         # Optionally save to a new table
         into = spec.get("into")
@@ -437,7 +469,7 @@ def op_group(db: str, table: str, spec: dict) -> dict:
             out["saved_to"] = into
         return out
     except sqlite3.Error as e:
-        raise TableToolError(f"SQLite error: {e}") from e
+        raise _sqlite_error(guard, e) from e
     finally:
         conn.close()
 
@@ -451,11 +483,8 @@ def op_query(db: str, sql: str) -> dict:
     """
     if not sql or not sql.strip():
         raise TableToolError("SQL query cannot be empty")
-    conn = connect(db)
-    guard = None
+    conn, guard = guarded_connect(db, "table_run_sql")
     try:
-        guard = QueueGuard(protected_tables(conn))
-        conn.set_authorizer(guard)
         cursor = conn.execute(sql)
         if cursor.description:
             rows = [dict(r) for r in cursor.fetchall()]
@@ -464,9 +493,7 @@ def op_query(db: str, sql: str) -> dict:
             conn.commit()
             return {"ok": True, "changes": conn.total_changes}
     except sqlite3.Error as e:
-        if guard is not None and guard.denied:
-            raise guard.error() from e
-        raise TableToolError(f"SQLite error: {e}") from e
+        raise _sqlite_error(guard, e) from e
     finally:
         conn.close()
 
@@ -506,14 +533,25 @@ def op_drop(db: str, table: str) -> dict:
     A registration outlives its table otherwise, and table_job_create refuses a
     name that is still registered — burning it for good, since the registry is
     not writable through table_run_sql.
+
+    The registry match is case-insensitive (COLLATE NOCASE folds ASCII only,
+    exactly like SQLite identifiers), because DROP TABLE matches the name that
+    way too: dropping "ITEMS_JOB" must deregister "items_job".
     """
     if not table or not table.strip():
         raise TableToolError("Table name cannot be empty")
+    if _fold(table) == _fold(JOBS_TABLE):
+        # Dropping the registry would deregister every job at once and leave
+        # all job tables unprotected; drop job tables one at a time instead.
+        raise TableToolError(
+            f"table_drop cannot drop the job registry '{JOBS_TABLE}'; "
+            "drop individual job tables instead"
+        )
     conn = connect(db)
     try:
         try:
             deregistered = conn.execute(
-                f'DELETE FROM "{JOBS_TABLE}" WHERE job_table = ?', (table,)
+                f'DELETE FROM "{JOBS_TABLE}" WHERE job_table = ? COLLATE NOCASE', (table,)
             ).rowcount
         except sqlite3.OperationalError:
             deregistered = 0  # registry table absent → no jobs were ever created
@@ -549,6 +587,8 @@ RESERVED_TASK_COLUMNS = (
     "_task_lease_expires",
     "_task_claimed_by",
 )
+
+_RESERVED_FOLDED = frozenset(c.lower() for c in RESERVED_TASK_COLUMNS)
 
 # The task lifecycle states, in the order a status view should present them.
 TASK_STATUSES = ("pending", "claimed", "done", "failed")
@@ -594,13 +634,23 @@ def protected_tables(conn: sqlite3.Connection) -> set:
     return {JOBS_TABLE, *list_job_tables(conn)}
 
 
+_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _fold(name) -> str:
+    """Case-fold an identifier the way SQLite matches them (ASCII only)."""
+    return (name or "").translate(_ASCII_FOLD)
+
+
 class QueueGuard:
     """SQLite authorizer denying writes to job-queue bookkeeping.
 
     A job's guarantees — atomic claims, the per-worker cap, lease requeue, the
     attempt limit, "finished work is never overwritten" — hold only while task
     state moves through the table_job_* tools. Arbitrary SQL could rewrite that
-    state, or the registry that governs it, so op_query runs behind this guard.
+    state, or the registry that governs it, so every caller-facing operation
+    that writes (op_query, op_insert, op_create_table, op_import_csv, op_join,
+    op_group) runs behind this guard; see guarded_connect.
 
     The authorizer fires at statement-prepare time with the table and column an
     action targets, so no SQL parsing is involved. It denies writes and leaves
@@ -608,38 +658,53 @@ class QueueGuard:
     caller's own data.
     """
 
-    def __init__(self, protected: set):
-        self.protected = protected
+    def __init__(self, protected: set, tool: str = "table_run_sql"):
+        # SQLite identifiers are case-insensitive, so compare folded names.
+        self.protected = {_fold(t) for t in protected}
+        self.tool = tool
         self.denied = None  # (table, detail) of the first refusal, for the error
 
     def _deny(self, table: str, detail: str = "") -> int:
         self.denied = (table, detail)
         return sqlite3.SQLITE_DENY
 
+    def _is_protected(self, table) -> bool:
+        return _fold(table) in self.protected
+
     def __call__(self, action, arg1, arg2, db_name, trigger) -> int:
+        # Statements inside a trigger body reach this callback too (with
+        # `trigger` set) when the statement that fires the trigger is
+        # prepared, so a trigger planted on an ordinary table cannot write the
+        # queue from a guarded connection.
         if action == sqlite3.SQLITE_UPDATE:
-            if arg1 == JOBS_TABLE:
+            if _fold(arg1) == _fold(JOBS_TABLE):
                 return self._deny(arg1, f"column {arg2}")
-            if arg1 in self.protected and arg2 in RESERVED_TASK_COLUMNS:
+            if self._is_protected(arg1) and _fold(arg2) in _RESERVED_FOLDED:
                 return self._deny(arg1, f"task bookkeeping column {arg2}")
         elif action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE):
-            if arg1 in self.protected:
+            if self._is_protected(arg1):
                 return self._deny(arg1)
-        elif action == sqlite3.SQLITE_DROP_TABLE:
-            if arg1 in self.protected:
+        elif action in (sqlite3.SQLITE_DROP_TABLE, sqlite3.SQLITE_DROP_TEMP_TABLE):
+            if self._is_protected(arg1):
+                return self._deny(arg1)
+        elif action in (sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_TEMP_TABLE):
+            # Pre-creating the registry (or a job table name) with a schema
+            # of the caller's choosing would shape the queue before any job.
+            if self._is_protected(arg1):
                 return self._deny(arg1)
         elif action == sqlite3.SQLITE_ALTER_TABLE:
             # Here arg1 is the schema name and arg2 the table.
-            if arg2 in self.protected:
+            if self._is_protected(arg2):
                 return self._deny(arg2)
-        elif action == sqlite3.SQLITE_CREATE_TRIGGER:
+        elif action in (sqlite3.SQLITE_CREATE_TRIGGER, sqlite3.SQLITE_CREATE_TEMP_TRIGGER):
             # A trigger on a protected table would write it on the caller's
             # behalf, from a statement that never names the columns.
-            if arg2 in self.protected:
+            if self._is_protected(arg2):
                 return self._deny(arg2, f"trigger {arg1}")
         elif action == sqlite3.SQLITE_PRAGMA:
             # SQLite already refuses sqlite_master writes unless this is on.
-            if arg1 == "writable_schema":
+            # Pragma names are case-insensitive and arrive as typed.
+            if _fold(arg1) == "writable_schema":
                 return self._deny("sqlite_master", "PRAGMA writable_schema")
         return sqlite3.SQLITE_OK
 
@@ -647,7 +712,7 @@ class QueueGuard:
         table, detail = self.denied
         where = f" ({detail})" if detail else ""
         return TableToolError(
-            f"table_run_sql cannot modify the job queue's bookkeeping: "
+            f"{self.tool} cannot modify the job queue's bookkeeping: "
             f"'{table}'{where} is managed by the table_job_* tools. Read it freely "
             f"with SELECT; change task state with table_job_claim/table_job_submit. "
             f"If the queue is misbehaving, that is a bug to report, not to work around."

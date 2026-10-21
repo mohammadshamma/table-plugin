@@ -16,6 +16,7 @@ is not installed) or: uv run test_csv_import.py    (runs everything)
 import asyncio
 import csv
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -71,6 +72,14 @@ class InferenceTest(unittest.TestCase):
     def test_reals(self):
         self.assertEqual(self.infer_one(["3.14", "-0.5"]), "REAL")
         self.assertEqual(self.infer_one([".5", "3.", "1e5", "2E-3", "+3.0"]), "REAL")
+
+    def test_overflowing_exponents_are_text(self):
+        # float() turns these into inf, which SQLite stores as Infinity and
+        # json.dumps emits as the invalid token Infinity. Keep them as text.
+        for v in ("1e500", "1234E567", "-9.9e999", "1e309"):
+            self.assertEqual(table_tool._classify_value(v), "TEXT", v)
+        self.assertEqual(self.infer_one(["1.5", "1e500"]), "TEXT")
+        self.assertEqual(self.infer_one(["1e308"]), "REAL")
 
     def test_mixed_int_and_real_is_real(self):
         self.assertEqual(self.infer_one(["1", "2.5", "3"]), "REAL")
@@ -164,6 +173,24 @@ class ImportCsvTest(unittest.TestCase):
     def test_missing_file(self):
         result = self.import_csv("t", str(self.dir / "nope.csv"))
         self.assertIn("not found", result["error"])
+
+    def test_overflowing_exponent_roundtrips_as_text(self):
+        path = self.write_csv("code\n1234E567\n1e500\n")
+        result = self.import_csv("codes", path)
+        self.assertEqual(result["columns"], {"code": "TEXT"})
+        rows = self.query("SELECT code FROM codes ORDER BY rowid")["rows"]
+        self.assertEqual([r["code"] for r in rows], ["1234E567", "1e500"])
+
+    @unittest.skipIf(sys.platform == "win32" or os.geteuid() == 0,
+                     "file permissions are not enforced here")
+    def test_unreadable_file(self):
+        path = self.write_csv("a\n1\n")
+        Path(path).chmod(0)
+        try:
+            result = self.import_csv("t", path)
+        finally:
+            Path(path).chmod(0o600)
+        self.assertIn("permission denied", result["error"])
 
     def test_empty_file(self):
         path = self.write_csv("")

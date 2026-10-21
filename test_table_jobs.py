@@ -932,6 +932,148 @@ class TestRunSqlQueueGuard(TableJobsTestBase):
         # No longer a registered job table, so it is ordinary data again.
         self.assertEqual(self.sql("DELETE FROM items_job")["changes"], 2)
 
+    def test_guard_is_case_insensitive(self):
+        for statement in (
+            "UPDATE ITEMS_JOB SET _TASK_STATUS = 'done'",
+            "UPDATE _Table_Jobs SET max_claims_per_worker = 0",
+            "CREATE TRIGGER t AFTER INSERT ON Items_Job BEGIN SELECT 1; END",
+            "CREATE TEMP TRIGGER t AFTER INSERT ON main.items_job BEGIN SELECT 1; END",
+            "PRAGMA WRITABLE_SCHEMA=ON",
+            "PRAGMA Writable_Schema=1",
+        ):
+            self.assertDenied(statement)
+        self.assertEqual(self.registry_cap(), 1)
+        self.assertTrue(all(r["_task_status"] == "pending" for r in self.root_job_rows()))
+
+
+class TestQueueGuardOnEveryWritePath(TableJobsTestBase):
+    """The guard must hold on every caller-facing write path, not just run_sql.
+
+    table_insert (and the other table_* tools) once opened unguarded
+    connections, so a worker could forge task results directly, or fire a
+    trigger planted on an ordinary table whose body rewrites the queue.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.cap_setup([{"name": "a", "score": 1}, {"name": "b", "score": 2}], ["w1"])
+        self.call_tool_sync("table_create", {
+            "conversation_id": "creator", "table": "plain", "columns": {"x": "INTEGER"},
+        })
+
+    def tool(self, name, **args):
+        return self.call_tool_sync(name, {"conversation_id": "creator", **args})
+
+    def assertDenied(self, res):
+        self.assertIn("cannot modify the job queue", res.get("error", ""), res)
+
+    def assertQueueIntact(self):
+        conn = self.db_conn(self.root_db())
+        try:
+            reg = conn.execute(
+                f'SELECT COUNT(*), MAX(max_claims_per_worker) FROM "{server.JOBS_TABLE}"'
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(tuple(reg), (1, 1))
+        rows = self.root_job_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r["_task_status"] == "pending" and r["result"] is None for r in rows))
+
+    def test_insert_cannot_forge_tasks_or_registry(self):
+        self.assertDenied(self.tool("table_insert", table="items_job", rows=[
+            {"name": "z", "score": 9, "_task_status": "done", "result": "forged"},
+        ]))
+        self.assertDenied(self.tool("table_insert", table="ITEMS_JOB", rows=[{"name": "z"}]))
+        self.assertDenied(self.tool("table_insert", table=server.JOBS_TABLE, rows=[
+            {"job_table": "fake", "max_claims_per_worker": 0},
+        ]))
+        self.assertQueueIntact()
+
+    def test_planted_trigger_cannot_fire_through_insert(self):
+        """The issue's exact chain: plant via run_sql, detonate via insert."""
+        planted = self.tool("table_run_sql", sql=(
+            "CREATE TRIGGER boom AFTER INSERT ON plain BEGIN "
+            "UPDATE _table_jobs SET max_claims_per_worker = 0; "
+            "UPDATE items_job SET _task_status = 'done', result = 'forged'; END"
+        ))
+        self.assertEqual(planted.get("ok"), True, planted)  # plain is caller data
+        self.assertDenied(self.tool("table_insert", table="plain", rows=[{"x": 1}]))
+        self.assertDenied(self.tool("table_run_sql", sql="INSERT INTO plain VALUES (1)"))
+        self.assertQueueIntact()
+        # The refused insert was rolled back as a whole.
+        self.assertEqual(self.tool("table_run_sql", sql="SELECT * FROM plain")["count"], 0)
+
+    def test_planted_trigger_cannot_fire_through_other_tools(self):
+        self.tool("table_run_sql", sql=(
+            "CREATE TRIGGER boom AFTER INSERT ON plain BEGIN "
+            "DELETE FROM items_job; END"
+        ))
+        # CREATE TABLE ... AS SELECT never fires triggers, but an INSERT does;
+        # route one through a view's INSTEAD OF trigger for good measure.
+        self.tool("table_run_sql", sql="CREATE VIEW v AS SELECT x FROM plain")
+        self.tool("table_run_sql", sql=(
+            "CREATE TRIGGER via_view INSTEAD OF INSERT ON v BEGIN "
+            "INSERT INTO plain VALUES (NEW.x); END"
+        ))
+        self.assertDenied(self.tool("table_run_sql", sql="INSERT INTO v VALUES (1)"))
+        self.assertDenied(self.tool("table_insert", table="v", rows=[{"x": 1}]))
+        self.assertQueueIntact()
+
+    def test_other_tools_cannot_create_or_write_queue_tables(self):
+        self.assertDenied(self.tool("table_create", table="_TABLE_JOBS", columns={"a": "TEXT"}))
+        self.assertDenied(self.tool("table_join", output_table="items_job",
+                                    left="plain", right="plain", type="cross",
+                                    if_not_exists=True))
+        self.assertDenied(self.tool("table_group_by", table="plain", by=["x"],
+                                    aggs={"n": "COUNT(*)"}, into="items_job"))
+        self.assertQueueIntact()
+
+    def test_ordinary_tables_still_work_everywhere(self):
+        self.assertEqual(self.tool("table_insert", table="plain", rows=[{"x": 1}, {"x": 2}])["inserted"], 2)
+        # A harmless trigger on caller data still fires.
+        self.tool("table_create", table="audit", columns={"x": "INTEGER"})
+        self.tool("table_run_sql", sql=(
+            "CREATE TRIGGER copy AFTER INSERT ON plain BEGIN "
+            "INSERT INTO audit VALUES (NEW.x); END"
+        ))
+        self.assertEqual(self.tool("table_insert", table="plain", rows=[{"x": 3}])["inserted"], 1)
+        self.assertEqual(self.tool("table_run_sql", sql="SELECT * FROM audit")["count"], 1)
+        self.assertEqual(self.tool("table_join", output_table="j", left="plain",
+                                   right="audit", on="x")["rows"], 1)
+        self.assertEqual(self.tool("table_group_by", table="plain", by=["x"],
+                                   aggs={"n": "COUNT(*)"}, into="g")["count"], 3)
+        # Job tables' source columns stay readable to the read-only tools.
+        self.assertEqual(self.tool("table_group_by", table="items_job", by=["name"],
+                                   aggs={"n": "COUNT(*)"})["count"], 2)
+
+
+class TestDropDeregistersCaseInsensitively(TableJobsTestBase):
+    def test_drop_with_different_case_deregisters(self):
+        self.make_source(rows=[{"name": "a", "score": 1}])
+        self.create_job()
+        res = self.call_tool_sync("table_drop", {"table": "ITEMS_JOB"})
+        self.assertEqual(res.get("deregistered"), True, res)
+        conn = self.db_conn()
+        try:
+            left = conn.execute(f'SELECT COUNT(*) FROM "{server.JOBS_TABLE}"').fetchone()[0]
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            conn.close()
+        self.assertEqual(left, 0)
+        self.assertNotIn("items_job", tables)
+        # The name is reusable, as with a same-case drop.
+        self.assertEqual(self.create_job()["ok"], True)
+
+    def test_drop_refuses_the_registry(self):
+        """Dropping the registry would release every job table's protection."""
+        self.make_source(rows=[{"name": "a", "score": 1}])
+        self.create_job()
+        for name in (server.JOBS_TABLE, "_TABLE_JOBS"):
+            res = self.call_tool_sync("table_drop", {"table": name})
+            self.assertIn("cannot drop the job registry", res.get("error", ""), res)
+        self.assertEqual(self.status()["total"], 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
