@@ -541,7 +541,13 @@ def op_drop(db: str, table: str) -> dict:
     if not table or not table.strip():
         raise TableToolError("Table name cannot be empty")
     conn = connect(db)
+    guard = None
     try:
+        # DROP TABLE runs an implicit DELETE whose foreign-key actions
+        # (ON DELETE CASCADE / SET NULL) write child tables and fire their
+        # triggers, so the drop itself runs behind QueueGuard. Only the
+        # deregistration below is exempt, and no trigger may fire from it.
+        conn.set_authorizer(no_trigger_authorizer)
         if _fold(table) == _fold(JOBS_TABLE):
             # Dropping the registry would deregister every job at once and
             # leave all job tables unprotected; drop job tables one at a time.
@@ -554,6 +560,8 @@ def op_drop(db: str, table: str) -> dict:
                     f"table_drop cannot drop the job registry '{JOBS_TABLE}'; "
                     "drop individual job tables instead"
                 )
+            guard = QueueGuard(protected_tables(conn) - {JOBS_TABLE}, "table_drop")
+            conn.set_authorizer(guard)
             conn.execute(f'DROP TABLE IF EXISTS "{table}"')
             conn.commit()
             return {"ok": True, "dropped": table}
@@ -563,6 +571,10 @@ def op_drop(db: str, table: str) -> dict:
             ).rowcount
         except sqlite3.OperationalError:
             deregistered = 0  # registry table absent → no jobs were ever created
+        # Read after the deregistration (same transaction), so the table
+        # being dropped is no longer protected but every other job is.
+        guard = QueueGuard(protected_tables(conn), "table_drop")
+        conn.set_authorizer(guard)
         conn.execute(f'DROP TABLE IF EXISTS "{table}"')
         conn.commit()
         result = {"ok": True, "dropped": table}
@@ -570,7 +582,8 @@ def op_drop(db: str, table: str) -> dict:
             result["deregistered"] = True
         return result
     except sqlite3.Error as e:
-        raise TableToolError(f"SQLite error: {e}") from e
+        conn.rollback()
+        raise _sqlite_error(guard, e) from e
     finally:
         conn.close()
 

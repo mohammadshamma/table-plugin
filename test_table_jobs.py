@@ -1020,6 +1020,31 @@ class TestQueueGuardOnEveryWritePath(TableJobsTestBase):
         self.assertDenied(self.tool("table_insert", table="v", rows=[{"x": 1}]))
         self.assertQueueIntact()
 
+    def test_planted_trigger_cannot_fire_through_drop_cascade(self):
+        """DROP TABLE's implicit DELETE runs ON DELETE CASCADE into child
+        tables, whose triggers then fire on table_drop's connection."""
+        for statement in (
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE child (pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+            "INSERT INTO parent VALUES (1)",
+            "INSERT INTO child VALUES (1)",
+            "CREATE TRIGGER td AFTER DELETE ON child BEGIN "
+            "UPDATE items_job SET _task_status = 'done', result = 'forged'; "
+            "UPDATE _table_jobs SET max_claims_per_worker = 0; END",
+        ):
+            self.assertEqual(self.tool("table_run_sql", sql=statement).get("ok"), True, statement)
+        self.assertDenied(self.tool("table_drop", table="parent"))
+        self.assertQueueIntact()
+        # Refused as a whole: the parent is still there.
+        self.assertEqual(self.tool("table_run_sql", sql="SELECT * FROM parent")["count"], 1)
+        # Without the trigger the cascade is ordinary data and the drop works.
+        self.tool("table_run_sql", sql="DROP TRIGGER td")
+        self.assertEqual(self.tool("table_drop", table="parent").get("ok"), True)
+
+    def test_drop_still_deregisters_and_drops_a_job_table(self):
+        res = self.tool("table_drop", table="items_job")
+        self.assertEqual((res.get("ok"), res.get("deregistered")), (True, True), res)
+
     def test_other_tools_cannot_create_or_write_queue_tables(self):
         self.assertDenied(self.tool("table_create", table="_TABLE_JOBS", columns={"a": "TEXT"}))
         self.assertDenied(self.tool("table_join", output_table="items_job",
