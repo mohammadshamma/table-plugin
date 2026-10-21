@@ -1095,6 +1095,56 @@ class TestRegistryCannotBePrepared(TableJobsTestBase):
         self.assertEqual(rows, [])  # rolled back as a whole
         self.assertNotIn("items_job", tables)
 
+    def prepare_and_rename(self, *statements):
+        for statement in statements:
+            self.assertEqual(self.sql(statement).get("ok"), True, statement)
+        self.assertEqual(self.sql("ALTER TABLE fake RENAME TO _table_jobs").get("ok"), True)
+
+    def assertJobRefused(self):
+        res = self.create_job(max_claims_per_worker=1)
+        self.assertIn("Refusing to use the job registry", res.get("error", ""), res)
+
+    def test_virtual_table_registry_is_refused(self):
+        """Its shadow tables are ordinary, unprotected tables."""
+        self.make_source(rows=[{"name": "a", "score": 1}])
+        res = self.sql("CREATE VIRTUAL TABLE _table_jobs USING fts5(a)")
+        self.assertIn("cannot modify the job queue", res.get("error", ""), res)
+        self.prepare_and_rename(
+            "CREATE VIRTUAL TABLE fake USING fts5(job_table, source_table, template, "
+            "lease_seconds, max_attempts, max_claims_per_worker, created_at)"
+        )
+        self.assertJobRefused()
+
+    def test_registry_with_foreign_key_actions_is_refused(self):
+        """An ON DELETE CASCADE could deregister a job from table_drop."""
+        self.make_source(rows=[{"name": "a", "score": 1}])
+        self.prepare_and_rename(
+            "CREATE TABLE caps (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE fake (job_table TEXT PRIMARY KEY, source_table TEXT, "
+            "template TEXT, lease_seconds REAL, max_attempts INTEGER, "
+            "max_claims_per_worker INTEGER REFERENCES caps(id) ON DELETE CASCADE, "
+            "created_at REAL)",
+        )
+        self.assertJobRefused()
+
+    def test_registry_with_extra_index_or_columns_is_refused(self):
+        self.make_source(rows=[{"name": "a", "score": 1}])
+        self.prepare_and_rename(
+            f"CREATE TABLE fake ({self.REGISTRY_COLS}, extra TEXT)",
+        )
+        self.assertJobRefused()
+
+    def test_look_alike_registry_can_be_dropped_then_job_created(self):
+        self.make_source(rows=[{"name": "a", "score": 1}])
+        self.prepare_and_rename(f"CREATE TABLE fake ({self.REGISTRY_COLS})",
+                                "CREATE INDEX fx ON fake(max_claims_per_worker)")
+        self.assertJobRefused()
+        self.assertEqual(self.call_tool_sync("table_drop", {"table": "_table_jobs"}).get("ok"), True)
+        self.assertEqual(self.create_job()["ok"], True)
+        # The genuine registry is not droppable.
+        res = self.call_tool_sync("table_drop", {"table": "_table_jobs"})
+        self.assertIn("cannot drop the job registry", res.get("error", ""), res)
+
 
 class TestDropDeregistersCaseInsensitively(TableJobsTestBase):
     def test_drop_with_different_case_deregisters(self):

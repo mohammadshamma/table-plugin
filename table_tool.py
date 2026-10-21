@@ -540,15 +540,23 @@ def op_drop(db: str, table: str) -> dict:
     """
     if not table or not table.strip():
         raise TableToolError("Table name cannot be empty")
-    if _fold(table) == _fold(JOBS_TABLE):
-        # Dropping the registry would deregister every job at once and leave
-        # all job tables unprotected; drop job tables one at a time instead.
-        raise TableToolError(
-            f"table_drop cannot drop the job registry '{JOBS_TABLE}'; "
-            "drop individual job tables instead"
-        )
     conn = connect(db)
     try:
+        if _fold(table) == _fold(JOBS_TABLE):
+            # Dropping the registry would deregister every job at once and
+            # leave all job tables unprotected; drop job tables one at a time.
+            # A look-alike the job tools refuse to adopt may be dropped.
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = ? COLLATE NOCASE", (JOBS_TABLE,)
+            ).fetchone()
+            if exists and registry_problem(conn) is None:
+                raise TableToolError(
+                    f"table_drop cannot drop the job registry '{JOBS_TABLE}'; "
+                    "drop individual job tables instead"
+                )
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+            conn.commit()
+            return {"ok": True, "dropped": table}
         try:
             deregistered = conn.execute(
                 f'DELETE FROM "{JOBS_TABLE}" WHERE job_table = ? COLLATE NOCASE', (table,)
@@ -623,6 +631,60 @@ def list_job_tables(conn: sqlite3.Connection) -> list:
     except sqlite3.OperationalError:
         return []  # registry table absent → no jobs
     return [r["job_table"] for r in rows]
+
+
+# The registry's columns as (name, declared type, primary-key position), the
+# shape server.py's ensure_jobs_table creates (column order aside: a legacy
+# registry gets max_claims_per_worker appended by migration).
+REGISTRY_COLUMNS = frozenset({
+    ("job_table", "TEXT", 1),
+    ("source_table", "TEXT", 0),
+    ("template", "TEXT", 0),
+    ("lease_seconds", "REAL", 0),
+    ("max_attempts", "INTEGER", 0),
+    ("max_claims_per_worker", "INTEGER", 0),
+    ("created_at", "REAL", 0),
+})
+
+
+def registry_problem(conn: sqlite3.Connection) -> str | None:
+    """Why the existing registry is not one the job tools created, or None.
+
+    Until the first job exists the registry name is free, and SQLite's
+    authorizer cannot see the target of ALTER TABLE ... RENAME, so a caller
+    could stand up a look-alike: a virtual table (whose shadow tables are
+    writable), or a table carrying foreign-key actions, triggers or indexes
+    that rewrite or block it. The job tools refuse to adopt anything but a
+    plain table of exactly the expected shape. Returns None when no registry
+    exists yet.
+    """
+    row = conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name = ? COLLATE NOCASE",
+        (JOBS_TABLE,),
+    ).fetchone()
+    if row is None:
+        others = conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = ? COLLATE NOCASE", (JOBS_TABLE,)
+        ).fetchone()
+        return f"'{JOBS_TABLE}' is a {others[0]}, not a table" if others else None
+    name, sql = row[0], row[1] or ""
+    if not sql.upper().startswith("CREATE TABLE"):
+        return f"'{name}' is not an ordinary table"
+    cols = conn.execute(f'PRAGMA table_xinfo("{name}")').fetchall()
+    if any(c[6] for c in cols):  # hidden / generated columns
+        return f"'{name}' has generated or hidden columns"
+    if {(c[1], (c[2] or "").upper(), c[5]) for c in cols} != REGISTRY_COLUMNS:
+        return f"'{name}' does not have the registry's columns"
+    if conn.execute(f'PRAGMA foreign_key_list("{name}")').fetchone():
+        return f"'{name}' has foreign keys"
+    extra = conn.execute(
+        "SELECT type, name FROM sqlite_master WHERE tbl_name = ? COLLATE NOCASE "
+        "AND type IN ('trigger', 'index') AND name NOT LIKE 'sqlite_autoindex_%'",
+        (JOBS_TABLE,),
+    ).fetchone()
+    if extra:
+        return f"'{name}' has a {extra[0]} ({extra[1]})"
+    return None
 
 
 def protected_tables(conn: sqlite3.Connection) -> set:
@@ -708,7 +770,12 @@ class QueueGuard:
             # view of the caller's choosing would shape the queue before any
             # job exists. (ALTER TABLE ... RENAME TO a protected name is not
             # visible here — SQLite passes only the old name — which is why
-            # job_connect's connections also run behind no_trigger_authorizer.)
+            # the job tools also check registry_problem() before adopting a
+            # registry, and run behind no_trigger_authorizer.)
+            if self._is_protected(arg1):
+                return self._deny(arg1)
+        elif action == sqlite3.SQLITE_CREATE_VTABLE:
+            # A virtual table's data lives in unprotected shadow tables.
             if self._is_protected(arg1):
                 return self._deny(arg1)
         elif action in (sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_CREATE_TEMP_INDEX):

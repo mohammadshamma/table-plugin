@@ -708,6 +708,12 @@ def ensure_jobs_table(conn: sqlite3.Connection) -> None:
             conn.execute(f'ALTER TABLE "{JOBS_TABLE}" ADD COLUMN max_claims_per_worker INTEGER')
         except sqlite3.OperationalError:
             pass  # another worker process won the migration race
+    problem = table_tool.registry_problem(conn)
+    if problem:
+        raise table_tool.TableToolError(
+            f"Refusing to use the job registry: {problem}. It was not created by "
+            f"table_job_create; drop it with table_drop(\"{JOBS_TABLE}\") and create the job again."
+        )
 
 
 def get_job(conn: sqlite3.Connection, job_table: str) -> dict:
