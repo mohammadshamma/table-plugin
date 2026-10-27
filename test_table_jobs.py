@@ -188,6 +188,35 @@ class TestJobCreate(TableJobsTestBase):
         list_res = self.call_tool_sync("table_list", {})
         self.assertNotIn("items_job", list_res["tables"])
 
+    def test_create_rowid_and_task_id_source_columns_rejected(self):
+        for i, col in enumerate(("rowid", "oid", "_rowid_", "_task_id", "ROWID", "Oid", "_RowId_", "_TASK_ID")):
+            tbl = f"src_{i}"
+            self.make_source(
+                rows=[{"name": "a", col: "bad"}],
+                columns={"name": "TEXT", col: "TEXT"},
+                table=tbl,
+            )
+            res = self.create_job(table=tbl, job_table=f"{tbl}_job", template="Do {name}")
+            self.assertIn(col, res.get("error", ""), f"column {col!r} was not rejected: {res}")
+
+    def test_create_reserved_source_column_case_insensitive_rejected(self):
+        for i, col in enumerate(("RESULT", "Result", "_TASK_STATUS", "_Task_Error",
+                                 "_TASK_ATTEMPTS", "_TASK_LEASE_EXPIRES", "_TASK_CLAIMED_BY")):
+            tbl = f"case_src_{i}"
+            self.make_source(
+                rows=[{"name": "a", col: "x"}],
+                columns={"name": "TEXT", col: "TEXT"},
+                table=tbl,
+            )
+            res = self.create_job(table=tbl, job_table=f"{tbl}_job", template="Do {name}")
+            self.assertIn(col, res.get("error", ""), f"column {col!r} was not rejected: {res}")
+
+    def test_create_malformed_template_rejected_with_tool_error(self):
+        self.make_source(rows=[{"name": "a", "score": 1}])
+        for bad in ("Summarize {name", "Summarize name}", "Summarize {name:{width"):
+            res = self.create_job(template=bad)
+            self.assertIn("error", res, f"malformed template {bad!r} did not return error: {res}")
+
     def test_create_existing_job_table_rejected(self):
         self.make_source(rows=[{"name": "a", "score": 1}])
         self.call_tool_sync("table_create", {"table": "items_job", "columns": {"x": "TEXT"}})
@@ -374,6 +403,9 @@ class TestJobSubmit(TableJobsTestBase):
         self.assertEqual(res["accepted"], False)
         self.assertEqual(res["task_status"], "pending")
         self.assertEqual(self.job_rows()[0]["_task_status"], "pending")
+        # Non-integer task_id returns a clean tool error.
+        bad = self.submit("not-an-int", result="x")
+        self.assertIn("error", bad)
 
     def test_submit_error_requeues_then_fails_at_max_attempts(self):
         self.make_source(rows=[{"name": "a", "score": 1}])

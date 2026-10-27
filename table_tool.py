@@ -598,8 +598,9 @@ def op_drop(db: str, table: str) -> dict:
 # The registry table listing every job (see server.py's ensure_jobs_table).
 JOBS_TABLE = "_table_jobs"
 
-# Columns a job table adds on top of its source columns. Source tables must not
-# use these names.
+# Columns reserved by a job table (bookkeeping columns added to the copy, plus
+# _task_id and SQLite's rowid aliases so user columns never shadow rowid or get
+# stripped during template rendering). Source tables must not use these names.
 RESERVED_TASK_COLUMNS = (
     "result",
     "_task_status",
@@ -607,6 +608,10 @@ RESERVED_TASK_COLUMNS = (
     "_task_attempts",
     "_task_lease_expires",
     "_task_claimed_by",
+    "_task_id",
+    "rowid",
+    "oid",
+    "_rowid_",
 )
 
 _RESERVED_FOLDED = frozenset(c.lower() for c in RESERVED_TASK_COLUMNS)

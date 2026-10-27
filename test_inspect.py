@@ -80,6 +80,7 @@ class InspectLifecycleTests(SessionScopingTestBase):
         self.pidfile.write_text(json.dumps(
             {"pid": 99999, "port": 8760, "url": "http://127.0.0.1:8760/", "started_at": 0}))
         with patch("server._pid_alive", return_value=True), \
+             patch("server._inspector_healthy", return_value=True), \
              patch("server.subprocess.Popen") as popen:
             res = self.call_tool_sync("table_inspect_start", {})
 
@@ -87,6 +88,23 @@ class InspectLifecycleTests(SessionScopingTestBase):
         self.assertTrue(res["already_running"])
         self.assertEqual(res["url"], "http://127.0.0.1:8760/")
         popen.assert_not_called()
+
+    def test_start_respawns_when_pid_recycled_and_unhealthy(self):
+        self.pidfile.write_text(json.dumps(
+            {"pid": 99999, "port": 8760, "url": "http://127.0.0.1:8760/", "started_at": 0}))
+        proc = _fake_proc(556)
+        with patch("server._pid_alive", return_value=True), \
+             patch("server._inspector_healthy", side_effect=[False, True]), \
+             patch("server.subprocess.Popen", return_value=proc) as popen:
+            res = self.call_tool_sync("table_inspect_start", {})
+
+        popen.assert_called_once()
+        self.assertNotIn("already_running", res)
+        self.assertEqual(json.loads(self.pidfile.read_text())["pid"], 556)
+
+    def test_pid_alive_returns_false_on_permission_error(self):
+        with patch("server.os.kill", side_effect=PermissionError):
+            self.assertFalse(server._pid_alive(12345))
 
     def test_start_respawns_on_stale_pidfile(self):
         self.pidfile.write_text(json.dumps(
@@ -115,6 +133,7 @@ class InspectLifecycleTests(SessionScopingTestBase):
         self.pidfile.write_text(json.dumps(
             {"pid": 4242, "port": 8760, "url": "http://127.0.0.1:8760/", "started_at": 0}))
         with patch("server._pid_alive", return_value=True), \
+             patch("server._inspector_healthy", return_value=True), \
              patch("server.os.getpgid", return_value=4242) as getpgid, \
              patch("server.os.killpg") as killpg:
             res = self.call_tool_sync("table_inspect_stop", {})
@@ -124,6 +143,35 @@ class InspectLifecycleTests(SessionScopingTestBase):
         self.assertEqual(res["stopped_pid"], 4242)
         getpgid.assert_called_once_with(4242)
         killpg.assert_called_once_with(4242, server.signal.SIGTERM)
+        self.assertFalse(self.pidfile.exists())
+
+    def test_stop_does_not_signal_recycled_unhealthy_pid(self):
+        self.pidfile.write_text(json.dumps(
+            {"pid": 4242, "port": 8760, "url": "http://127.0.0.1:8760/", "started_at": 0}))
+        with patch("server._pid_alive", return_value=True), \
+             patch("server._inspector_healthy", return_value=False), \
+             patch("server.os.killpg") as killpg, \
+             patch("server.os.kill") as kill:
+            res = self.call_tool_sync("table_inspect_stop", {})
+
+        self.assertTrue(res["ok"])
+        self.assertFalse(res["was_running"])
+        self.assertIsNone(res["stopped_pid"])
+        killpg.assert_not_called()
+        kill.assert_not_called()
+        self.assertFalse(self.pidfile.exists())
+
+    def test_idle_watchdog_removes_pidfile_on_exit(self):
+        import os
+        self.pidfile.write_text(json.dumps(
+            {"pid": os.getpid(), "port": 8760, "url": "http://127.0.0.1:8760/", "started_at": 0}))
+        inspect_server._STATE["db"] = str(self.cwd_dir / "session.db")
+        inspect_server._STATE["last_activity"] = 0
+        with patch("inspect_server.time.sleep"), \
+             patch("inspect_server.os._exit", side_effect=SystemExit) as mock_exit:
+            with self.assertRaises(SystemExit):
+                inspect_server._idle_watchdog()
+        mock_exit.assert_called_once_with(0)
         self.assertFalse(self.pidfile.exists())
 
     def test_stop_when_not_running(self):

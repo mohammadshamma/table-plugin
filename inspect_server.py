@@ -19,6 +19,7 @@ Usage: inspect_server.py --db <path> --port <port>
 
 import argparse
 import html
+import json
 import math
 import os
 import sqlite3
@@ -38,6 +39,7 @@ PREVIEW_CHARS = 120
 IDLE_TIMEOUT = 1800  # self-exit after 30 min with no requests (zombie backstop)
 REFRESH_JOB_SECONDS = 2  # job pages track live worker progress
 REFRESH_SECONDS = 5  # other pages: row counts and results still change mid-job
+INSPECT_PIDFILE_NAME = ".inspect.json"
 
 STATUS_FILTERS = ("all",) + table_tool.TASK_STATUSES
 
@@ -68,7 +70,7 @@ def table_exists(conn: sqlite3.Connection, name: str) -> bool:
 def source_columns(conn: sqlite3.Connection, name: str) -> list:
     """A job table's non-bookkeeping columns, in declared order."""
     cols = [r["name"] for r in conn.execute(f'PRAGMA table_info("{name}")')]
-    return [c for c in cols if c not in table_tool.RESERVED_TASK_COLUMNS]
+    return [c for c in cols if table_tool._fold(c) not in table_tool._RESERVED_FOLDED]
 
 
 def clamp_page(page, size):
@@ -531,11 +533,29 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
 
+def _cleanup_pidfile(db_path: str | None) -> None:
+    """Remove the session's .inspect.json if it still points to this process."""
+    if not db_path:
+        return
+    pidfile = Path(db_path).parent / INSPECT_PIDFILE_NAME
+    try:
+        record = json.loads(pidfile.read_text())
+        if isinstance(record, dict) and record.get("pid") not in (None, os.getpid()):
+            return
+    except (OSError, ValueError):
+        pass
+    try:
+        pidfile.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _idle_watchdog():
     """Exit if idle too long or the DB disappears — a zombie-server backstop."""
     while True:
         time.sleep(60)
         if time.time() - _STATE["last_activity"] > IDLE_TIMEOUT:
+            _cleanup_pidfile(_STATE["db"])
             os._exit(0)
 
 
@@ -557,6 +577,7 @@ def main(argv=None):
         pass
     finally:
         httpd.server_close()
+        _cleanup_pidfile(args.db)
 
 
 if __name__ == "__main__":

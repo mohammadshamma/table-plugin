@@ -123,13 +123,17 @@ def op_version() -> dict:
     return result
 
 
-def find_parent_conversation(child_id: str, brain_dir: Path) -> str | None:
+def find_parent_conversation(
+    child_id: str, brain_dir: Path, exclude: set[str] | None = None
+) -> str | None:
     """
     Scans the directories in brain_dir for transcript.jsonl logs.
     Identifies if a parent conversation has invoked the given child_id.
     """
     if not child_id or not brain_dir.is_dir():
         return None
+
+    skip = {child_id} if exclude is None else (exclude | {child_id})
 
     # Check for exact UUID boundary (UUIDs consist of hex chars and dashes)
     def matches_boundary(target_id: str, text: str) -> bool:
@@ -148,6 +152,8 @@ def find_parent_conversation(child_id: str, brain_dir: Path) -> str | None:
         subdirs = [d for d in brain_dir.iterdir() if d.is_dir()]
 
     for session_dir in subdirs:
+        if session_dir.name in skip:
+            continue
         try:
             transcript_path = session_dir / ".system_generated" / "logs" / "transcript.jsonl"
             if not transcript_path.is_file():
@@ -196,8 +202,8 @@ def find_root_conversation(current_id: str, brain_dir: Path) -> str:
         if curr in visited:
             break
         visited.add(curr)
-        parent = find_parent_conversation(curr, brain_dir)
-        if not parent:
+        parent = find_parent_conversation(curr, brain_dir, visited)
+        if not parent or parent in visited:
             break
         curr = parent
     return curr
@@ -676,7 +682,11 @@ def job_connect(db: str) -> sqlite3.Connection:
 def extract_template_placeholders(template: str) -> set[str]:
     """Column names referenced by {placeholder} fields in a template."""
     placeholders = set()
-    for _literal, field, _spec, _conv in string.Formatter().parse(template):
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError as e:
+        raise table_tool.TableToolError(f"Invalid template: {e}") from e
+    for _literal, field, _spec, _conv in parsed:
         if field is None:
             continue
         name = field.split(".")[0].split("[")[0]
@@ -782,7 +792,10 @@ def op_job_create(db: str, args: dict) -> dict:
                 f"Template references unknown column(s): {', '.join(unknown)}. "
                 f"Available columns: {', '.join(source_columns)}"
             )
-        collisions = [c for c in source_columns if c in RESERVED_TASK_COLUMNS]
+        collisions = [
+            c for c in source_columns
+            if table_tool._fold(c) in table_tool._RESERVED_FOLDED
+        ]
         if collisions:
             raise table_tool.TableToolError(
                 f"Source column(s) collide with job bookkeeping columns: {', '.join(collisions)}. "
@@ -913,7 +926,7 @@ def op_job_claim(db: str, args: dict) -> dict:
 
         row_values = {
             k: v for k, v in dict(row).items()
-            if k != "_task_id" and k not in RESERVED_TASK_COLUMNS
+            if table_tool._fold(k) not in table_tool._RESERVED_FOLDED
         }
         try:
             # A render failure still spends this worker's claim: the stamp and
@@ -945,9 +958,12 @@ def op_job_submit(db: str, args: dict) -> dict:
     if (result is None) == (error is None):
         raise table_tool.TableToolError("Provide exactly one of 'result' or 'error'")
     task_id_raw = args.get("task_id")
-    if task_id_raw is None:
+    if task_id_raw is None or isinstance(task_id_raw, bool):
         raise table_tool.TableToolError("'task_id' is required")
-    task_id = int(task_id_raw)
+    try:
+        task_id = int(task_id_raw)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise table_tool.TableToolError(f"'task_id' must be an integer, got {task_id_raw!r}") from e
 
     conn = job_connect(db)
     try:
@@ -1041,14 +1057,12 @@ def inspect_paths(db_path: str) -> tuple[Path, Path]:
 
 def _pid_alive(pid: int) -> bool:
     """True if a process with this pid exists and is signalable."""
-    if not pid or pid <= 0:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError, OSError):
         return False
-    except PermissionError:
-        return True  # exists but owned by another user
     return True
 
 
@@ -1077,10 +1091,12 @@ def _pick_free_port(preferred: int) -> int:
 
 
 def _inspector_healthy(port: int, timeout: float = 0.3) -> bool:
+    if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+        return False
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=timeout):
             return True
-    except (urllib.error.URLError, OSError):
+    except (urllib.error.URLError, OSError, ValueError):
         return False
 
 
@@ -1089,7 +1105,11 @@ def op_inspect_start(db: str, args: dict) -> dict:
 
     # Idempotent: reuse a live instance rather than stacking servers.
     existing = _read_inspect_pidfile(pidfile)
-    if existing and _pid_alive(existing.get("pid", 0)):
+    if (
+        existing
+        and _pid_alive(existing.get("pid", 0))
+        and _inspector_healthy(existing.get("port", 0))
+    ):
         return {
             "ok": True,
             "already_running": True,
@@ -1098,7 +1118,7 @@ def op_inspect_start(db: str, args: dict) -> dict:
             "db": db,
         }
     if existing:
-        pidfile.unlink(missing_ok=True)  # stale (dead pid)
+        pidfile.unlink(missing_ok=True)  # stale (dead pid or unhealthy)
 
     if not script.is_file():
         raise table_tool.TableToolError(f"Inspector script not found: {script}")
@@ -1156,11 +1176,16 @@ def op_inspect_stop(db: str, args: dict) -> dict:
         return {"ok": True, "was_running": False}
 
     pid = record.get("pid", 0)
+    port = record.get("port", 0)
     stopped = False
-    if _pid_alive(pid):
+    if _pid_alive(pid) and _inspector_healthy(port):
         # Signal the whole session group (start_new_session made pid the leader).
         try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            pgid = os.getpgid(pid)
+            if pgid == pid:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
             stopped = True
         except (ProcessLookupError, OSError):
             try:

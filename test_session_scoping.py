@@ -1023,6 +1023,55 @@ class TestSessionScopingTier2(SessionScopingTestBase):
         expected_db = self.brain_dir / "root-1" / ".tables" / "session.db"
         self.assertTrue(expected_db.exists())
 
+    def test_tc_scope_bnd_07_self_reference_in_subagent_transcript(self):
+        # root-1 spawns child-1; child-1 spawns grandchild-1 and mentions its
+        # own conversation_id (child-1) in the INVOKE_SUBAGENT prompt. Because
+        # child-1's directory is modified after root-1's, scanning newest-first
+        # without skipping child_id would match child-1 as its own parent.
+        self.write_mock_transcript("root-1", "child-1")
+        self.write_mock_transcript(
+            "child-1",
+            "grandchild-1",
+            content='Pass conversation_id="child-1" or your own.\n{"conversationId": "grandchild-1"}',
+        )
+        os.utime(self.brain_dir / "root-1", (1000, 1000))
+        os.utime(self.brain_dir / "child-1", (2000, 2000))
+
+        self.call_tool_sync("table_create", {
+            "conversation_id": "child-1",
+            "table": "t",
+            "columns": {"x": "INTEGER"},
+        })
+        expected_db = self.brain_dir / "root-1" / ".tables" / "session.db"
+        self.assertTrue(expected_db.exists())
+        self.assertFalse((self.brain_dir / "child-1" / ".tables" / "session.db").exists())
+
+    def test_tc_scope_bnd_08_visited_descendant_mentions_ancestor(self):
+        # root-1 -> child-1 -> grandchild-1, and grandchild-1's own
+        # INVOKE_SUBAGENT mentions child-1. When resolving grandchild-1,
+        # grandchild-1 is newer than root-1 and must not be matched as the
+        # parent of child-1.
+        self.write_mock_transcript("root-1", "child-1")
+        self.write_mock_transcript("child-1", "grandchild-1")
+        self.write_mock_transcript(
+            "grandchild-1",
+            "greatgrandchild-1",
+            content='Spawned under child-1.\n{"conversationId": "greatgrandchild-1"}',
+        )
+        os.utime(self.brain_dir / "root-1", (1000, 1000))
+        os.utime(self.brain_dir / "child-1", (2000, 2000))
+        os.utime(self.brain_dir / "grandchild-1", (3000, 3000))
+
+        self.call_tool_sync("table_create", {
+            "conversation_id": "grandchild-1",
+            "table": "t",
+            "columns": {"x": "INTEGER"},
+        })
+        expected_db = self.brain_dir / "root-1" / ".tables" / "session.db"
+        self.assertTrue(expected_db.exists())
+        self.assertFalse((self.brain_dir / "child-1" / ".tables" / "session.db").exists())
+        self.assertFalse((self.brain_dir / "grandchild-1" / ".tables" / "session.db").exists())
+
     # --- Fallback Boundaries ---
     def test_tc_fallback_bnd_01_readonly_cwd(self):
         if "ANTIGRAVITY_CONVERSATION_ID" in os.environ:
