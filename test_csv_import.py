@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "mcp==1.30.0",
+#     "mcp==2.3.0",
 # ]
 # ///
 """
@@ -271,13 +271,9 @@ class McpWiringTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def call_tool_sync(self, name: str, arguments: dict) -> dict:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        res = loop.run_until_complete(server.call_tool(name, arguments))
-        return json.loads(res[0].text)
+        params = server.types.CallToolRequestParams(name=name, arguments=arguments)
+        res = asyncio.run(server.call_tool(None, params))
+        return json.loads(res.content[0].text)
 
     def test_import_and_already_exists(self):
         path = self.dir / "data.csv"

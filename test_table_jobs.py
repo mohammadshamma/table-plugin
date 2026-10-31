@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "mcp==1.30.0",
+#     "mcp==2.3.0",
 #     "anyio",
 # ]
 # ///

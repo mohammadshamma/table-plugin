@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "mcp==1.30.0",
+#     "mcp==2.3.0",
 #     "anyio",
 # ]
 # ///
@@ -79,15 +79,9 @@ class SessionScopingTestBase(unittest.TestCase):
 
     def call_tool_sync(self, name: str, arguments: dict) -> dict:
         """Helper to run the async call_tool in a synchronous runner."""
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        # We invoke server.call_tool directly
-        res = loop.run_until_complete(server.call_tool(name, arguments))
-        return json.loads(res[0].text)
+        params = server.types.CallToolRequestParams(name=name, arguments=arguments)
+        res = asyncio.run(server.call_tool(None, params))
+        return json.loads(res.content[0].text)
 
     def write_mock_transcript(self, parent_id: str, child_id: str, content: str = None) -> Path:
         """Helper to create a parent-child relationship transcript log."""
@@ -1457,13 +1451,59 @@ class TestSessionScopingTier4(SessionScopingTestBase):
             self.assertTrue(expected_db.exists())
 
     def test_tc_real_10_path_traversal_injection(self):
-        # Passing an unsafe conversation_id should raise a ValueError
-        with self.assertRaises(ValueError):
-            asyncio.run(server.call_tool("table_create", {
+        # Passing an unsafe conversation_id should be rejected with an error result
+        # by call_tool (and raise ValueError in dispatch).
+        params = server.types.CallToolRequestParams(
+            name="table_create",
+            arguments={
                 "conversation_id": "../../../unsafe",
                 "table": "t",
-                "columns": {"x": "INTEGER"}
-            }))
+                "columns": {"x": "INTEGER"},
+            },
+        )
+        res = asyncio.run(server.call_tool(None, params))
+        self.assertTrue(res.is_error)
+        self.assertIn(
+            "Invalid conversation_id format",
+            json.loads(res.content[0].text).get("error", ""),
+        )
+        with self.assertRaises(ValueError):
+            server.dispatch("table_create", {
+                "conversation_id": "../../../unsafe",
+                "table": "t",
+                "columns": {"x": "INTEGER"},
+            })
+
+    def test_tc_real_11_mcp_2x_handler_contracts(self):
+        # list_tools returns ListToolsResult with all declared tools
+        listed = asyncio.run(server.list_tools(None, None))
+        self.assertIsInstance(listed, server.types.ListToolsResult)
+        self.assertEqual([t.name for t in listed.tools], [t.name for t in server.TOOLS])
+
+        # call_tool accepts arguments=None
+        res_none = asyncio.run(
+            server.call_tool(None, server.types.CallToolRequestParams(name="table_list", arguments=None))
+        )
+        self.assertFalse(res_none.is_error)
+        self.assertEqual(json.loads(res_none.content[0].text).get("tables"), [])
+
+        # Missing required arguments return clean tool errors (no KeyError/TypeError)
+        required_tools = [t.name for t in server.TOOLS if t.input_schema.get("required")]
+        self.assertEqual(len(required_tools), 11)
+        for tool_name in required_tools:
+            res_empty = self.call_tool_sync(tool_name, {})
+            self.assertIn("error", res_empty, f"{tool_name} with {{}} did not return error: {res_empty}")
+        res_missing_cols = self.call_tool_sync("table_create", {"table": "t"})
+        self.assertIn("columns", res_missing_cols.get("error", ""))
+        res_missing_rows = self.call_tool_sync("table_insert", {"table": "t"})
+        self.assertIn("rows", res_missing_rows.get("error", ""))
+
+        # Unknown tool name returns CallToolResult(is_error=True) rather than uncaught exception
+        res_unknown = asyncio.run(
+            server.call_tool(None, server.types.CallToolRequestParams(name="no_such_tool", arguments={}))
+        )
+        self.assertTrue(res_unknown.is_error)
+        self.assertIn("Unknown tool", json.loads(res_unknown.content[0].text).get("error", ""))
 
 
 class TestVersionTool(SessionScopingTestBase):

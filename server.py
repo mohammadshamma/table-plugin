@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "mcp==1.30.0",
+#     "mcp==2.3.0",
 # ]
 # ///
 """
@@ -33,6 +33,7 @@ import table_tool
 
 import anyio
 import mcp.types as types
+from mcp.server import ServerRequestContext
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
@@ -1197,7 +1198,8 @@ def op_inspect_stop(db: str, args: dict) -> dict:
     return {"ok": True, "was_running": stopped, "stopped_pid": pid if stopped else None}
 
 
-def dispatch(name: str, args: dict) -> dict:
+def dispatch(name: str, args: dict | None = None) -> dict:
+    args = args or {}
     # Answered before the database is resolved: a version check must not create
     # a session db, and must work even when path resolution would fail.
     if name == "table_version":
@@ -1206,14 +1208,14 @@ def dispatch(name: str, args: dict) -> dict:
     db_path = get_resolved_db_path(args)
 
     if name == "table_create":
-        spec = {"columns": args["columns"]}
+        spec = {"columns": args.get("columns")}
         for key in ("primary_key", "unique", "if_not_exists"):
             if args.get(key) is not None:
                 spec[key] = args[key]
         return table_tool.op_create_table(db_path, args.get("table"), spec)
 
     elif name == "table_insert":
-        return table_tool.op_insert(db_path, args.get("table"), {"rows": args["rows"]})
+        return table_tool.op_insert(db_path, args.get("table"), {"rows": args.get("rows")})
 
     elif name == "table_join":
         spec = {k: v for k, v in args.items() if k not in ("output_table", "conversation_id")}
@@ -1266,22 +1268,38 @@ def dispatch(name: str, args: dict) -> dict:
         raise ValueError(f"Unknown tool: {name}")
 
 
-server = Server("table", version=PLUGIN_VERSION)
+async def list_tools(
+    ctx: ServerRequestContext | None = None,
+    params: types.PaginatedRequestParams | None = None,
+) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=TOOLS)
 
 
-@server.list_tools()
-async def list_tools() -> list[types.Tool]:
-    return TOOLS
-
-
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+async def call_tool(
+    ctx: ServerRequestContext | None,
+    params: types.CallToolRequestParams,
+) -> types.CallToolResult:
+    is_error = False
     try:
-        result = dispatch(name, arguments)
+        result = dispatch(params.name, params.arguments or {})
     except table_tool.TableToolError as e:
         # Expected errors from table_tool operations
         result = {"error": str(e)}
-    return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+    except Exception as e:
+        result = {"error": str(e)}
+        is_error = True
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))],
+        is_error=is_error,
+    )
+
+
+server = Server(
+    "table",
+    version=PLUGIN_VERSION,
+    on_list_tools=list_tools,
+    on_call_tool=call_tool,
+)
 
 
 async def main():
