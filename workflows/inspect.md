@@ -1,37 +1,37 @@
 ---
-description: Turn on a local, read-only web UI so the user can browse any row of any table in the session — plus a status and per-task drill-down view for job tables — in their browser.
+description: Surface the Table Inspector auxiliary pane link so the user can browse table rows and monitor job progress in the IDE's side pane.
 ---
 
-# Inspect tables in a browser
+# Inspect tables in the Table Inspector
 
-Follow these steps exactly. The `table_inspect_start` MCP tool launches a
-localhost, read-only web server against this session's database and returns a URL;
-`table_inspect_stop` shuts it down. The web UI does all the rendering — you never
-paste table rows into your context.
+Follow these steps exactly. Antigravity provides an auxiliary pane UI extension
+for inspecting tables and job progress. You do not need to call any MCP tools to
+start or stop the inspector — instead, surface the `[Table Inspector](sidecar://table/inspector/)`
+link to open the view in the auxiliary side pane. The web UI does all the
+rendering — you never paste table rows into your context.
 
 1. Recognize the intent: the user wants to *look at* their data — e.g. "inspect my
    tables", "let me browse the data", "show me the job that's running", "open the
-   table viewer".
+   table viewer", "open inspector".
 
-2. Read your conversationId from your User Information/Metadata and pass it as
-   `conversation_id` in every table tool call in this workflow (so the inspector
-   points at the same session database as your other table tools).
+2. Provide the user with the link to open the auxiliary pane:
+   `[Table Inspector](sidecar://table/inspector/)`
 
-3. Call `table_inspect_start`. Pass `port` only if the user asked for a specific
-   one. The tool is idempotent — if an inspector is already running it just returns
-   the existing URL (`already_running: true`); do not try to start a second one.
+3. Explain what they can do in the inspector:
+   - Browse every table's rows (paginated, sortable by clicking any column header).
+   - Use the top switcher bar to toggle between "All tables" and individual tables or jobs.
+   - For **job tables**, see a live status summary (pending/claimed/done/failed and a
+     complete flag) with a filterable, per-task drill-down showing each task's error
+     and result.
+   - Pages auto-refresh in place (the job view every ~2s), so a running job can be
+     watched live without reloading.
 
-4. Give the user the returned `url` and tell them to open it in a browser. Mention
-   that they can browse every table's rows (paginated, and sortable by clicking any
-   column header) and that **job tables get a special view**: a status summary
-   (pending/claimed/done/failed and a complete flag) with a filterable, per-task
-   drill-down showing each task's error and result. Pages auto-refresh in place
-   (the job view every ~2s), so a running job can be watched live without reloading.
+4. If the user asks to close or stop the inspector, inform them that they can simply
+   close or collapse the Table Inspector auxiliary pane in their IDE; no MCP tool
+   call or background server shutdown is needed.
 
-5. When the user is done — or says "stop" / "turn it off" / "close the inspector" —
-   call `table_inspect_stop`.
-
-**Rules:** the inspector is localhost-only and **read-only** — it can never modify
-the data, and its `claimed` counts may lag a live `table_job_status` call because it
-does not requeue expired leases. It shows whatever is in the session database right
-now; you don't need to pre-load or summarize anything for it.
+**Rules:** the inspector is **read-only** — it can never modify session data, and
+its `claimed` counts may lag a live `table_job_status` call because it does not
+requeue expired leases. It automatically scopes to the active session database; you
+don't need to pre-load or summarize anything for it. Do not attempt to call
+`table_inspect_start` or `table_inspect_stop` as those tools are no longer present.

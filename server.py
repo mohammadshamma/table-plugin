@@ -17,15 +17,12 @@ import hashlib
 import json
 import os
 import re
-import signal
-import socket
 import sqlite3
 import string
 import subprocess
 import sys
+import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -38,21 +35,15 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 
-import threading
-
-# Thread-safe in-memory cache for conversation_id -> root_conversation_id
-LINEAGE_CACHE = {}
-LINEAGE_CACHE_LOCK = threading.Lock()
-
-
-def get_brain_dir() -> Path:
-    """Get the brain directory path where conversation sessions are stored."""
-    return Path.home() / ".gemini" / "antigravity" / "brain"
-
-
-def get_scratch_dir() -> Path:
-    """Get the scratch directory path."""
-    return Path.home() / ".gemini" / "antigravity" / "scratch"
+# Lineage helpers are hosted in table_tool.py so stdlib-only consumers like
+# inspect_server.py can use them without importing mcp. They are re-exported
+# here so callers, tests, and mocks continue to work identically.
+LINEAGE_CACHE = table_tool.LINEAGE_CACHE
+LINEAGE_CACHE_LOCK = table_tool.LINEAGE_CACHE_LOCK
+get_brain_dir = table_tool.get_brain_dir
+get_scratch_dir = table_tool.get_scratch_dir
+find_parent_conversation = table_tool.find_parent_conversation
+find_root_conversation = table_tool.find_root_conversation
 
 
 # ─── Build identity ──────────────────────────────────────────────────────────
@@ -63,7 +54,7 @@ def get_scratch_dir() -> Path:
 # names the code THIS process is actually running; op_version re-reads the same
 # files at call time, and a mismatch means a restart is pending.
 
-PLUGIN_VERSION = "0.0.4"
+PLUGIN_VERSION = "0.0.5"
 PLUGIN_DIR = Path(__file__).resolve().parent
 SOURCE_FILES = ("server.py", "table_tool.py")
 
@@ -122,92 +113,6 @@ def op_version() -> dict:
             "call runs the older code."
         )
     return result
-
-
-def find_parent_conversation(
-    child_id: str, brain_dir: Path, exclude: set[str] | None = None
-) -> str | None:
-    """
-    Scans the directories in brain_dir for transcript.jsonl logs.
-    Identifies if a parent conversation has invoked the given child_id.
-    """
-    if not child_id or not brain_dir.is_dir():
-        return None
-
-    skip = {child_id} if exclude is None else (exclude | {child_id})
-
-    # Check for exact UUID boundary (UUIDs consist of hex chars and dashes)
-    def matches_boundary(target_id: str, text: str) -> bool:
-        escaped = re.escape(target_id)
-        pattern = rf"(?<![a-f0-9-])" + escaped + rf"(?![a-f0-9-])"
-        return bool(re.search(pattern, text, re.IGNORECASE))
-
-    # Sort brain_dir subdirectories by modification time (newest first) for determinism
-    try:
-        subdirs = sorted(
-            [d for d in brain_dir.iterdir() if d.is_dir()],
-            key=lambda d: d.stat().st_mtime,
-            reverse=True
-        )
-    except Exception:
-        subdirs = [d for d in brain_dir.iterdir() if d.is_dir()]
-
-    for session_dir in subdirs:
-        if session_dir.name in skip:
-            continue
-        try:
-            transcript_path = session_dir / ".system_generated" / "logs" / "transcript.jsonl"
-            if not transcript_path.is_file():
-                continue
-        except Exception:
-            continue
-
-        try:
-            with open(transcript_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except Exception:
-                        continue
-
-                    if not isinstance(entry, dict):
-                        continue
-
-                    if entry.get("type") != "INVOKE_SUBAGENT":
-                        continue
-
-                    content = entry.get("content")
-                    if isinstance(content, (dict, list)):
-                        content_str = json.dumps(content)
-                    elif content is None:
-                        content_str = "null"
-                    else:
-                        content_str = str(content)
-
-                    if matches_boundary(child_id, content_str):
-                        return session_dir.name
-        except Exception:
-            continue
-
-    return None
-
-
-def find_root_conversation(current_id: str, brain_dir: Path) -> str:
-    """Recursively traces parent conversation IDs up to the ultimate root conversation."""
-    visited = set()
-    curr = current_id
-    while curr:
-        if curr in visited:
-            break
-        visited.add(curr)
-        parent = find_parent_conversation(curr, brain_dir, visited)
-        if not parent or parent in visited:
-            break
-        curr = parent
-    return curr
 
 
 def is_writable(path: Path) -> bool:
@@ -607,39 +512,6 @@ TOOLS = [
             "required": ["table", "file_path"],
         },
     ),
-    types.Tool(
-        name="table_inspect_start",
-        description=(
-            "Start a local, read-only web UI for browsing this session's tables in a browser: "
-            "every row of any table (paginated), plus a status/drill-down view for job tables. "
-            "Returns a localhost URL to give the user. Idempotent — returns the existing URL if "
-            "already running. Stop it with table_inspect_stop."
-        ),
-        inputSchema={
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "additionalProperties": False,
-            "type": "object",
-            "properties": {
-                "conversation_id": CONV_ID_ARG,
-                "port": {
-                    "description": "Preferred TCP port (default 8760); falls back to the next free port if occupied",
-                    "type": "number",
-                },
-            },
-        },
-    ),
-    types.Tool(
-        name="table_inspect_stop",
-        description="Stop the local table-inspector web UI started by table_inspect_start.",
-        inputSchema={
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "additionalProperties": False,
-            "type": "object",
-            "properties": {
-                "conversation_id": CONV_ID_ARG,
-            },
-        },
-    ),
 ]
 
 
@@ -1032,172 +904,6 @@ def op_job_status(db: str, args: dict) -> dict:
         conn.close()
 
 
-# ─── Web inspector (table_inspect_* tools) ───────────────────────────────────
-#
-# A localhost, read-only web UI for browsing the session's tables and jobs in a
-# browser. The agent turns it on/off via table_inspect_start/stop. The launcher
-# must live here because only this process can resolve the session DB path (via
-# get_resolved_db_path); it hands that path to inspect_server.py, spawned as a
-# detached background subprocess so it outlives this stdio server.
-
-DEFAULT_INSPECT_PORT = 8760
-INSPECT_PIDFILE_NAME = ".inspect.json"
-INSPECT_PORT_ATTEMPTS = 20
-
-
-def inspect_paths(db_path: str) -> tuple[Path, Path]:
-    """(pidfile, web-server script) for a given resolved DB path.
-
-    The pidfile sits next to the DB so inspector state is per-session and gets
-    cleaned up with the session; the script ships alongside server.py.
-    """
-    pidfile = Path(db_path).parent / INSPECT_PIDFILE_NAME
-    script = Path(__file__).resolve().parent / "inspect_server.py"
-    return pidfile, script
-
-
-def _pid_alive(pid: int) -> bool:
-    """True if a process with this pid exists and is signalable."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    return True
-
-
-def _read_inspect_pidfile(pidfile: Path) -> dict | None:
-    try:
-        return json.loads(pidfile.read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def _pick_free_port(preferred: int) -> int:
-    """First free localhost port at or above `preferred` (wrapping stays in range)."""
-    for offset in range(INSPECT_PORT_ATTEMPTS):
-        port = preferred + offset
-        if port > 65535:
-            break
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("127.0.0.1", port))
-                return port
-            except OSError:
-                continue
-    raise table_tool.TableToolError(
-        f"No free port found in range {preferred}-{preferred + INSPECT_PORT_ATTEMPTS - 1}"
-    )
-
-
-def _inspector_healthy(port: int, timeout: float = 0.3) -> bool:
-    if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
-        return False
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=timeout):
-            return True
-    except (urllib.error.URLError, OSError, ValueError):
-        return False
-
-
-def op_inspect_start(db: str, args: dict) -> dict:
-    pidfile, script = inspect_paths(db)
-
-    # Idempotent: reuse a live instance rather than stacking servers.
-    existing = _read_inspect_pidfile(pidfile)
-    if (
-        existing
-        and _pid_alive(existing.get("pid", 0))
-        and _inspector_healthy(existing.get("port", 0))
-    ):
-        return {
-            "ok": True,
-            "already_running": True,
-            "url": existing.get("url"),
-            "port": existing.get("port"),
-            "db": db,
-        }
-    if existing:
-        pidfile.unlink(missing_ok=True)  # stale (dead pid or unhealthy)
-
-    if not script.is_file():
-        raise table_tool.TableToolError(f"Inspector script not found: {script}")
-
-    port_raw = args.get("port")
-    preferred = DEFAULT_INSPECT_PORT if port_raw is None else int(port_raw)
-    if not (1024 <= preferred <= 65535):
-        raise table_tool.TableToolError("'port' must be between 1024 and 65535")
-    port = _pick_free_port(preferred)
-
-    # Run the (stdlib-only) inspector with this server's own interpreter rather
-    # than `uv run`: sys.executable is guaranteed to exist and satisfy the
-    # >=3.11 requirement, with no PATH lookup, uv resolution, or network access.
-    # Detached so it survives this stdio server; DEVNULL so it never writes to
-    # the MCP stdout stream (which would corrupt the JSON-RPC protocol).
-    proc = subprocess.Popen(
-        [sys.executable, str(script), "--db", db, "--port", str(port)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
-
-    deadline = time.time() + 8.0
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            raise table_tool.TableToolError(
-                f"Inspector exited immediately (code {proc.returncode})"
-            )
-        if _inspector_healthy(port):
-            break
-        time.sleep(0.15)
-    else:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, OSError):
-            proc.kill()
-        raise table_tool.TableToolError("Inspector did not become healthy in time")
-
-    url = f"http://127.0.0.1:{port}/"
-    record = {"pid": proc.pid, "port": port, "url": url, "started_at": time.time()}
-    try:
-        pidfile.write_text(json.dumps(record))
-    except OSError as e:
-        raise table_tool.TableToolError(f"Could not write inspector pidfile: {e}") from e
-
-    return {"ok": True, "url": url, "port": port, "db": db}
-
-
-def op_inspect_stop(db: str, args: dict) -> dict:
-    pidfile, _ = inspect_paths(db)
-    record = _read_inspect_pidfile(pidfile)
-    if not record:
-        return {"ok": True, "was_running": False}
-
-    pid = record.get("pid", 0)
-    port = record.get("port", 0)
-    stopped = False
-    if _pid_alive(pid) and _inspector_healthy(port):
-        # Signal the whole session group (start_new_session made pid the leader).
-        try:
-            pgid = os.getpgid(pid)
-            if pgid == pid:
-                os.killpg(pgid, signal.SIGTERM)
-            else:
-                os.kill(pid, signal.SIGTERM)
-            stopped = True
-        except (ProcessLookupError, OSError):
-            try:
-                os.kill(pid, signal.SIGTERM)
-                stopped = True
-            except (ProcessLookupError, OSError):
-                stopped = False
-    pidfile.unlink(missing_ok=True)
-    return {"ok": True, "was_running": stopped, "stopped_pid": pid if stopped else None}
-
-
 def dispatch(name: str, args: dict | None = None) -> dict:
     args = args or {}
     # Answered before the database is resolved: a version check must not create
@@ -1257,12 +963,6 @@ def dispatch(name: str, args: dict | None = None) -> dict:
 
     elif name == "table_job_status":
         return op_job_status(db_path, args)
-
-    elif name == "table_inspect_start":
-        return op_inspect_start(db_path, args)
-
-    elif name == "table_inspect_stop":
-        return op_inspect_stop(db_path, args)
 
     else:
         raise ValueError(f"Unknown tool: {name}")

@@ -23,8 +23,6 @@ You have access to database tools via the `table` MCP server. Use these tools to
 - **table_job_claim** — Claim the next pending task; returns its id and rendered prompt — or a null task when the queue is drained, or a null task with a `reason` when this worker hit its claim limit and must terminate.
 - **table_job_submit** — Submit a claimed task's result (or an error, which requeues it until attempts run out).
 - **table_job_status** — Task counts (total/pending/claimed/done/failed) and a `complete` flag.
-- **table_inspect_start** — Launch a localhost, read-only web UI for browsing any table's rows (paginated, sortable by any column) and a live auto-refreshing status/drill-down view for job tables; returns a URL. Idempotent.
-- **table_inspect_stop** — Shut down the inspector web UI.
 
 ## Importing External Data (table_import_csv)
 
@@ -33,7 +31,7 @@ Use `table_import_csv` whenever the user has a CSV file to get into a table. The
 > Tip: if an `/import_csv` workflow is installed, invoke it instead of improvising this recipe.
 
 - The header row is required and provides the column names.
-- The response includes the inferred `columns` and `inserted` count — report these to the user; no follow-up `table_schema` call needed.
+- The response includes the inferred `columns` and `inserted` count — report these to the user; no follow-up `table_schema` call needed. Proactively include a link to the [Table Inspector](sidecar://table/inspector/) in your response (once per conversation) so the user can browse the imported table.
 - If the table already exists the tool errors; ask the user before `table_drop` + retry — never drop silently.
 
 ## Processing Every Row with Subagents (table_job_* tools)
@@ -44,7 +42,7 @@ Use the `table_job_*` tools when a table's rows each need an LLM task performed 
 
 ### Orchestrating (main agent)
 
-1. Call `table_job_create` with the source `table`, a `template` containing `{column}` placeholders (e.g. `"Summarize this review: {review_text}"`), and a `job_table` name. The job table is a snapshot copy of the source rows plus a `result` column and task bookkeeping.
+1. Call `table_job_create` with the source `table`, a `template` containing `{column}` placeholders (e.g. `"Summarize this review: {review_text}"`), and a `job_table` name. The job table is a snapshot copy of the source rows plus a `result` column and task bookkeeping. Proactively include a link to the [Table Inspector](sidecar://table/inspector/) in your response (once per conversation) so the user can monitor job progress in the auxiliary pane.
 2. Call `table_job_status`. If `complete` is true, stop and report the `done` and `failed` counts.
 3. Otherwise dispatch `min(pending, 5)` workers as described below. Dispatch each worker as its **own background (asynchronous) subagent**, so that each worker's result comes back to you individually as it finishes — do not launch them as one blocking "run these N in parallel" batch if your harness offers a non-blocking form. Assemble each worker's prompt from the three-part frame below: the opening and closing are verbatim (substitute only the job table name); the execution slot in the middle is yours to fill.
 
@@ -83,13 +81,18 @@ Use the `table_job_*` tools when a table's rows each need an LLM task performed 
 - The job table persists in the session database, so an interrupted job can be resumed later by simply running the status/spawn loop again.
 - These guarantees hold only because task state moves through the `table_job_*` tools. The job table's `_task_*` columns and the `_table_jobs` registry are therefore read-only everywhere else — `table_run_sql`, `table_insert` and the other `table_*` tools refuse to write them, including through a trigger. If the queue seems to be misbehaving, that is a bug to report, not to work around.
 
-## Browsing tables in a browser (table_inspect_* tools)
+## Browsing tables in the Table Inspector (Auxiliary Pane)
 
-When the user wants to *look at* their data rather than query it, use `table_inspect_start` to launch a local, read-only web UI and hand them the returned `url`. It lets them browse every row of any table (paginated, sortable asc/desc by clicking any column header), and renders **job tables specially**: a status summary (pending/claimed/done/failed + a `complete` flag) with a filterable, per-task drill-down that surfaces each task's error and result. Pages live-update in place (the job view every ~2s; auto-refresh pauses in background tabs and can be toggled off), so a running job can be watched without reloading. The tool is idempotent — a second `table_inspect_start` just returns the URL of the already-running instance. Call `table_inspect_stop` when the user is done.
+When the user wants to *look at* their data rather than query it, surface the Table Inspector auxiliary pane by emitting the markdown link `[Table Inspector](sidecar://table/inspector/)`. Do this:
+- **On demand**: whenever the user asks to inspect data, view tables, browse rows, or monitor job progress (e.g. "inspect my tables", "let me browse the data", "open the table viewer").
+- **Proactively once per conversation**: include the link when a table is created or imported (via `table_create` or `table_import_csv`), or when a table job is started (via `table_job_create`).
+
+The Table Inspector is an Antigravity auxiliary pane UI extension automatically scoped to the active conversation's SQLite database. It lets the user browse every row of any table (paginated, sortable asc/desc by clicking any column header), switch between tables and jobs via a top switcher bar, and renders **job tables specially**: a status summary (pending/claimed/done/failed + a `complete` flag) with a filterable, per-task drill-down that surfaces each task's error and result. Pages live-update in place (the job view every ~2s; auto-refresh pauses in background tabs and can be toggled off), so a running job can be watched without reloading.
 
 > Tip: if an `/inspect` workflow is installed, invoke it instead of improvising this recipe.
 
-- The inspector is bound to `127.0.0.1` and opens the database **read-only** — it can never modify session data.
+- The inspector runs as an Antigravity sidecar and opens the database **read-only** (`mode=ro`) — it can never modify session data.
+- No MCP tools are needed to start or stop the inspector; Antigravity manages the sidecar lifecycle and UI display.
 - Its `claimed` counts can lag a live `table_job_status` because the read-only view does not requeue expired leases; `table_job_status` remains the source of truth for orchestration loops.
 
 ## Usage Notes

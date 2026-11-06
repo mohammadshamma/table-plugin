@@ -19,6 +19,6 @@ Follow these steps exactly. The `table_import_csv` MCP tool does all the work se
 
 4. If it errors with "already exists": ask the user whether to replace the table. Only after they confirm, call `table_drop` and retry the import — never drop silently.
 
-5. Report to the user: the table name, the `inserted` row count, and the inferred column types from the `columns` field of the response.
+5. Report to the user: the table name, the `inserted` row count, and the inferred column types from the `columns` field of the response. Proactively provide a link to the [Table Inspector](sidecar://table/inspector/) (once per conversation) so the user can browse the imported table in the auxiliary pane.
 
 **Rules:** never read or paste the CSV's rows yourself — the whole point is that the data flows file → SQLite without entering context. If the import fails validation (ragged rows, duplicate headers), report the tool's error message; nothing was created.

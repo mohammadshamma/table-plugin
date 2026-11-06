@@ -22,7 +22,7 @@ inside a real Antigravity session.
 uv run test_session_scoping.py         # server + session-scoped DB routing
 uv run test_table_jobs.py              # table_job_* work-queue semantics
 uv run test_csv_import.py              # CSV type inference + import wiring
-uv run test_inspect.py                 # inspector lifecycle + web-UI rendering
+uv run test_inspect.py                 # sidecar config, scoping, auth, UI & theme rendering
 python3 -m unittest test_table_tool -v # table_tool CLI (pure stdlib)
 ```
 
@@ -65,7 +65,7 @@ handshake from the shell without Antigravity:
 } | uv run server.py
 ```
 
-The response to `id: 2` should list all 15 `table_*` tools. (The `sleep`
+The response to `id: 2` should list all 14 `table_*` tools. (The `sleep`
 keeps stdin open long enough for the server to answer before the pipe
 closes.)
 
@@ -108,12 +108,14 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 ### Alternative: install straight from the local directory
 
 ```bash
-agy plugin validate /path/to/your/checkout
 agy plugin install /path/to/your/checkout
 ```
 
-This copies a snapshot of your checkout, so you must re-run the install after
-every change — fine for a one-off test, tedious as a loop. The symlink
+You can validate the plugin structure before installing:
+```bash
+agy plugin validate table-plugin
+```
+This confirms that `plugin.json`, skills, rules, MCP servers, and sidecars (`sidecars 1`) are recognized. Note that installing straight from a directory copies a snapshot of your checkout, so you must re-run the install after every change — fine for a one-off test, tedious as a loop. The symlink
 approach avoids it.
 
 ### Picking up changes
@@ -123,13 +125,15 @@ approach avoids it.
   MCP servers from the IDE's MCP panel.
 - **`skills/table/SKILL.md` / `workflows/*.md`** — read per conversation;
   start a new conversation to pick up edits.
-- **`inspect_server.py`** — spawned fresh by each `table_inspect_start`, so
-  just ask the agent to stop and restart the inspector (`table_inspect_stop`,
-  then `table_inspect_start`).
+- **`inspect_server.py` / `sidecar.json`** — managed as a persistent sidecar
+  daemon by Antigravity (`table/inspector`). In development, reload the
+  sidecar or restart Antigravity to pick up sidecar edits. You can also run it
+  standalone for rapid UI iteration:
+  `python3 inspect_server.py --port 8760 --db /tmp/dev.db`
 
 ### Verify end-to-end
 
-1. Open Antigravity and confirm the `table` MCP server is up with all 15
+1. Open Antigravity and confirm the `table` MCP server is up with all 14
    tools (the IDE's MCP panel shows the tool list and any startup errors).
 2. Run the smoke conversation from the README:
    ```
@@ -137,9 +141,9 @@ approach avoids it.
    > Insert Alice (30, alice@example.com) and Bob (25, bob@example.com)
    > Group users by age and count them
    ```
-3. Ask the agent to *"inspect my tables"* — `table_inspect_start` should hand
-   you a `http://127.0.0.1:<port>` URL where you can browse the rows you just
-   inserted.
+3. Ask the agent to *"inspect my tables"* — the agent will provide a
+   `[Table Inspector](sidecar://table/inspector/)` link that opens the
+   session-scoped Table Inspector in Antigravity's auxiliary side pane.
 
 ### Where the data lands
 
@@ -165,10 +169,13 @@ To reproduce the session routing outside Antigravity, export
 - **Server won't start in Antigravity** — see the
   [Troubleshooting](README.md#troubleshooting) section of the README (PATH
   issues with `uv`, install-path mismatches, first-launch network).
-- **Inspector state** — the running inspector's `{pid, port, url}` is
-  recorded in `.inspect.json` next to the session DB; `table_inspect_start`
-  reuses a live instance and clears stale pidfiles, and the server self-exits
-  after 30 minutes idle.
+- **Sidecar inspector** — Antigravity discovers the sidecar at
+  `sidecars/inspector/sidecar.json` and runs it as an auxiliary pane UI
+  extension (`table/inspector`). The sidecar dynamically resolves the SQLite
+  DB for the active conversation from `?conversationId=<id>` using
+  `table_tool.find_root_conversation()`, authenticates via
+  `ANTIGRAVITY_SIDECAR_UI_TOKEN`, and handles light/dark themes via
+  host `theme-change` postMessages.
 - **Job bookkeeping** — a job table carries its queue state in the
   `_task_status`, `_task_error`, `_task_attempts`, `_task_lease_expires`, and
   `_task_claimed_by` columns; query them with `table_run_sql` or `sqlite3`
@@ -182,6 +189,7 @@ To reproduce the session routing outside Antigravity, export
 - If you changed tool behavior or schemas, update `skills/table/SKILL.md`
   and the relevant `workflows/*.md` recipe to match; every user-initiated
   operation gets a workflow recipe.
-- Keep `inspect_server.py` at the repo root next to `server.py` — it's
-  located via `Path(__file__).parent` and imports `table_tool`.
-- Bump `version` in `plugin.json`.
+- Keep `inspect_server.py` at the repo root next to `server.py` — it is
+  invoked by `sidecars/inspector/sidecar.json` (`../../inspect_server.py`) and
+  imports `table_tool`.
+- Bump `version` in `plugin.json` and `PLUGIN_VERSION` in `server.py`.

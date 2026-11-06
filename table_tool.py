@@ -27,6 +27,8 @@ import math
 import re
 import sqlite3
 import sys
+import threading
+from pathlib import Path
 
 
 class TableToolError(Exception):
@@ -826,6 +828,125 @@ class QueueGuard:
             f"with SELECT; change task state with table_job_claim/table_job_submit. "
             f"If the queue is misbehaving, that is a bug to report, not to work around."
         )
+
+
+# ─── Lineage and Session Helpers ─────────────────────────────────────────────
+
+LINEAGE_CACHE: dict[str, str] = {}
+LINEAGE_CACHE_LOCK = threading.Lock()
+
+
+def get_brain_dir() -> Path:
+    """Get the brain directory path where conversation sessions are stored."""
+    return Path.home() / ".gemini" / "antigravity" / "brain"
+
+
+def get_scratch_dir() -> Path:
+    """Get the scratch directory path."""
+    return Path.home() / ".gemini" / "antigravity" / "scratch"
+
+
+def find_parent_conversation(
+    child_id: str, brain_dir: Path, exclude: set[str] | None = None
+) -> str | None:
+    """
+    Scans the directories in brain_dir for transcript.jsonl logs.
+    Identifies if a parent conversation has invoked the given child_id.
+    """
+    if not child_id or not brain_dir.is_dir():
+        return None
+
+    skip = {child_id} if exclude is None else (exclude | {child_id})
+
+    # Check for exact conversation ID boundary (valid chars: alphanumeric, underscore, hyphen)
+    def matches_boundary(target_id: str, text: str) -> bool:
+        escaped = re.escape(target_id)
+        pattern = rf"(?<![a-zA-Z0-9_-])" + escaped + rf"(?![a-zA-Z0-9_-])"
+        return bool(re.search(pattern, text, re.IGNORECASE))
+
+    default_brain = Path.home() / ".gemini" / "antigravity" / "brain"
+    insiders_brain = Path.home() / ".gemini" / "antigravity-insiders" / "brain"
+    search_dirs = [brain_dir]
+    if brain_dir == default_brain and insiders_brain.is_dir():
+        search_dirs.append(insiders_brain)
+
+    # Sort brain_dir subdirectories by modification time (newest first) for determinism
+    all_subdirs = [
+        d for bdir in search_dirs if bdir.is_dir() for d in bdir.iterdir() if d.is_dir()
+    ]
+    try:
+        subdirs = sorted(
+            all_subdirs,
+            key=lambda d: d.stat().st_mtime,
+            reverse=True
+        )
+    except Exception:
+        subdirs = all_subdirs
+
+    child_id_lower = child_id.lower()
+
+    for session_dir in subdirs:
+        if session_dir.name in skip:
+            continue
+        try:
+            transcript_path = session_dir / ".system_generated" / "logs" / "transcript.jsonl"
+            if not transcript_path.is_file():
+                continue
+        except Exception:
+            continue
+
+        try:
+            with open(transcript_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if child_id_lower not in line.lower() and "\\u" not in line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+
+                    if not isinstance(entry, dict):
+                        continue
+
+                    step_type = entry.get("type")
+                    if step_type not in ("INVOKE_SUBAGENT", "GENERIC"):
+                        continue
+
+                    content = entry.get("content")
+                    if isinstance(content, (dict, list)):
+                        content_str = json.dumps(content)
+                    elif content is None:
+                        content_str = "null"
+                    else:
+                        content_str = str(content)
+
+                    if step_type == "GENERIC" and "Created the following subagent" not in content_str:
+                        continue
+
+                    if matches_boundary(child_id, content_str):
+                        return session_dir.name
+        except Exception:
+            continue
+
+    return None
+
+
+def find_root_conversation(current_id: str, brain_dir: Path) -> str:
+    """Recursively traces parent conversation IDs up to the ultimate root conversation."""
+    visited = set()
+    curr = current_id
+    while curr:
+        if curr in visited:
+            break
+        visited.add(curr)
+        parent = find_parent_conversation(curr, brain_dir, visited)
+        if not parent or parent in visited:
+            break
+        curr = parent
+    return curr
 
 
 # ─── CLI Commands ────────────────────────────────────────────────────────────

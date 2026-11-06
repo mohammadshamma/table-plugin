@@ -1,0 +1,18 @@
+{
+  "command": "python3",
+  "args": [
+    "../../inspect_server.py"
+  ],
+  "restart_policy": "always",
+  "has_web_ui": true,
+  "ui_config": {
+    "views": [
+      {
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "path": "/",
+        "title": "Table Inspector"
+      }
+    ]
+  },
+  "description": "Read-only web inspector for session SQLite tables and jobs"
+}

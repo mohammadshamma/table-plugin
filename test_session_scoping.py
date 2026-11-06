@@ -1066,6 +1066,114 @@ class TestSessionScopingTier2(SessionScopingTestBase):
         self.assertFalse((self.brain_dir / "child-1" / ".tables" / "session.db").exists())
         self.assertFalse((self.brain_dir / "grandchild-1" / ".tables" / "session.db").exists())
 
+    def test_tc_scope_bnd_09_uuid_boundary_precision(self):
+        """
+        Verify that subagent invocation matching enforces strict identifier boundaries.
+        A parent transcript mentioning 'xabc-123', 'abc-123x', 'my_child_session',
+        'child_session_2', or 'Spawning' must NOT match child sessions 'abc-123',
+        'child_session', or 'S'.
+        """
+        # 1. Setup mock transcripts with near-miss prefixes and suffixes
+        self.write_mock_transcript(
+            "parent-prefix-nonhex", "dummy",
+            content='Invoked subagent {"conversationId": "xabc-123"}'
+        )
+        self.write_mock_transcript(
+            "parent-suffix-nonhex", "dummy",
+            content='Invoked subagent {"conversationId": "abc-123x"}'
+        )
+        self.write_mock_transcript(
+            "parent-prefix-underscore", "dummy",
+            content='Invoked subagent {"conversationId": "my_child_session"}'
+        )
+        self.write_mock_transcript(
+            "parent-suffix-underscore", "dummy",
+            content='Invoked subagent {"conversationId": "child_session_2"}'
+        )
+        self.write_mock_transcript(
+            "parent-word-substring", "dummy",
+            content='Spawning subagent for work'
+        )
+
+        # 2. Direct lineage function checks: near-misses must NOT match
+        self.assertIsNone(
+            server.find_parent_conversation("abc-123", self.brain_dir),
+            "Non-hex prefix/suffix was incorrectly matched as parent"
+        )
+        self.assertIsNone(
+            server.find_parent_conversation("child_session", self.brain_dir),
+            "Underscore prefix/suffix was incorrectly matched as parent"
+        )
+        self.assertIsNone(
+            server.find_parent_conversation("S", self.brain_dir),
+            "Word substring was incorrectly matched as parent"
+        )
+
+        # 3. End-to-end tool call scoping check: child is its own root
+        os.environ["ANTIGRAVITY_CONVERSATION_ID"] = "abc-123"
+        res = self.call_tool_sync("table_create", {"table": "isolated_tbl", "columns": {"id": "INTEGER"}})
+        self.assertEqual(res.get("ok"), True)
+
+        expected_child_db = self.brain_dir / "abc-123" / ".tables" / "session.db"
+        self.assertTrue(expected_child_db.exists(), "Child session should be its own root DB")
+        for bad_parent in [
+            "parent-prefix-nonhex",
+            "parent-suffix-nonhex",
+            "parent-prefix-underscore",
+            "parent-suffix-underscore",
+            "parent-word-substring"
+        ]:
+            bad_db = self.brain_dir / bad_parent / ".tables" / "session.db"
+            self.assertFalse(bad_db.exists(), f"Erroneously created DB under {bad_parent}")
+
+        # 4. Positive verification: exact match works correctly alongside near-misses
+        with server.LINEAGE_CACHE_LOCK:
+            server.LINEAGE_CACHE.clear()
+        self.write_mock_transcript("real-parent", "abc-123")
+        self.assertEqual(
+            server.find_parent_conversation("abc-123", self.brain_dir),
+            "real-parent"
+        )
+        self.assertEqual(
+            server.find_root_conversation("abc-123", self.brain_dir),
+            "real-parent"
+        )
+
+    def test_tc_scope_bnd_10_generic_subagent_step_type(self):
+        """
+        Verify that Antigravity's real-world GENERIC tool result steps
+        ('Created the following subagent:\\n{"conversationId": ...}') are recognized
+        by find_parent_conversation while ordinary GENERIC steps are ignored.
+        """
+        log_dir = self.brain_dir / "generic-parent" / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = log_dir / "transcript.jsonl"
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Some unrelated tool output mentioning random-id-999",
+            }) + "\n")
+            f.write(json.dumps({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": (
+                    "Created At: 2026-11-05T21:16:17-08:00\n"
+                    "Created the following subagent:\n"
+                    "{\n  \"conversationId\": \"real-subagent-id\"\n}\n"
+                ),
+            }) + "\n")
+
+        self.assertIsNone(server.find_parent_conversation("random-id-999", self.brain_dir))
+        self.assertEqual(
+            server.find_parent_conversation("real-subagent-id", self.brain_dir),
+            "generic-parent",
+        )
+
     # --- Fallback Boundaries ---
     def test_tc_fallback_bnd_01_readonly_cwd(self):
         if "ANTIGRAVITY_CONVERSATION_ID" in os.environ:

@@ -56,8 +56,7 @@ agy plugin install https://github.com/mohammadshamma/table-plugin
 | `table_job_claim` | Claim the next pending task (id + rendered prompt) |
 | `table_job_submit` | Submit a claimed task's result or error |
 | `table_job_status` | Task counts and a `complete` flag |
-| `table_inspect_start` | Launch a localhost, read-only web UI to browse tables and jobs; returns a URL |
-| `table_inspect_stop` | Shut down the inspector web UI |
+| `table_version` | Inspect plugin version, build hash, loaded status, and file paths |
 
 ## Example conversation
 
@@ -130,15 +129,31 @@ so the policy can only be relaxed globally. A relaxed policy auto-approves
 **all** agent actions, not just the table tools — restore your usual setting
 after the job finishes.
 
-## Inspecting your data in a browser
+## Inspecting your data in the Auxiliary Pane
 
-Ask the agent to "inspect my tables" and it calls `table_inspect_start`, which
-launches a small localhost web UI (`inspect_server.py`, stdlib-only) and hands
-you a URL. You can page through every row of any table, and **job tables get a
-dedicated view**: a status summary (pending/claimed/done/failed + a `complete`
-flag) with a filterable, per-task drill-down showing each task's error and
-result. The server binds `127.0.0.1` and opens the database **read-only**, so
-browsing can never mutate your session data; `table_inspect_stop` shuts it down.
+Ask the agent to "inspect my tables" (or open the Table Inspector after
+creating/importing a table or starting a job), and the agent provides a link to
+the inspector:
+
+[Table Inspector](sidecar://table/inspector/)
+
+Clicking the link opens the Table Inspector directly in Antigravity's auxiliary
+side pane. It runs as a lightweight, stdlib-only sidecar daemon
+(`inspect_server.py`, registered via `sidecars/inspector/sidecar.json`), scoped
+automatically per request to the active conversation's SQLite database.
+
+Features:
+- **Per-request conversation scoping**: automatically connects to the current
+  session database (`<brain>/<root_id>/.tables/session.db`) read-only.
+- **Top switcher bar**: quickly navigate between "All tables" and dedicated
+  tabs for individual tables and jobs.
+- **Dedicated job view**: status summary (pending/claimed/done/failed + a
+  `complete` flag) with a filterable, per-task drill-down showing error and
+  result columns.
+- **Theme synchronization**: dynamically matches Antigravity's light and dark
+  editor themes via host `theme-change` events.
+- **Zero mutation**: opens databases with `mode=ro` so inspecting never
+  modifies session data.
 
 Copy the workflow in for a one-command entry point:
 
@@ -149,15 +164,24 @@ cp workflows/inspect.md /path/to/your/project/.agent/workflows/
 ## Architecture
 
 ```
-Antigravity ──► MCP Server (server.py) ──► table_tool.py ──► Database
-                Python + stdio (uv run)    imported module   .db file
+Antigravity Host ──► MCP Server (server.py) ───────► table_tool.py ──► Session Database
+  (stdio, uv run)    14 tools                        imported module   (.tables/session.db)
+                                                               ▲
+Auxiliary Pane   ──► Sidecar (inspect_server.py) ───────────┘
+  (sidecar://)       HTTP, stdlib-only, per-request scoping
 ```
 
 `server.py` is a single-file [PEP 723](https://peps.python.org/pep-0723/)
 script: `uv run` reads its inline metadata, provisions Python and the pinned
 `mcp` SDK, and starts the server. Tool calls dispatch directly to functions
 imported from `table_tool.py` — no subprocess per call. `table_tool.py` also
-remains usable standalone as a CLI.
+hosts lineage resolution helpers and remains usable standalone as a CLI.
+
+`inspect_server.py` is a stdlib-only HTTP server running as an Antigravity
+sidecar (`table/inspector`), configured in `sidecars/inspector/sidecar.json`
+with `SIDECAR_UI_ENTRYPOINT_AUX_PANE`. It authenticates requests via
+`ANTIGRAVITY_SIDECAR_UI_TOKEN`, resolves the active session database per
+request from `?conversationId=<id>`, and serves the compact auxiliary pane UI.
 
 ## Development
 
@@ -167,7 +191,7 @@ Run the test suites:
 uv run test_session_scoping.py         # server + session-scoped routing
 uv run test_table_jobs.py              # table_job_* work-queue tools
 uv run test_csv_import.py              # CSV type inference + import wiring
-uv run test_inspect.py                 # inspector lifecycle + web-UI rendering
+uv run test_inspect.py                 # sidecar config, scoping, auth, UI & theme rendering
 python3 -m unittest test_table_tool -v # table_tool CLI (pure stdlib)
 ```
 

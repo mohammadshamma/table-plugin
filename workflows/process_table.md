@@ -17,7 +17,7 @@ Follow these steps exactly. The `table_job_*` MCP tools own all bookkeeping (row
 
 2. Read your conversationId from your User Information/Metadata and pass it as `conversation_id` in every table tool call in this workflow.
 
-3. Call `table_job_create` with the source `table`, `template`, and `job_table`. Leave `max_claims_per_worker` at its default (1) — the claim-once worker frame in step 5 depends on it. Report the `total_tasks` count to the user.
+3. Call `table_job_create` with the source `table`, `template`, and `job_table`. Leave `max_claims_per_worker` at its default (1) — the claim-once worker frame in step 5 depends on it. Report the `total_tasks` count to the user, and surface a link to the [Table Inspector](sidecar://table/inspector/) (proactively once per conversation) so the user can watch the queue drain and monitor per-task progress live in the auxiliary pane.
 
 4. Call `table_job_status` for the job table.
    - If `complete` is true, go to step 6.
@@ -48,6 +48,6 @@ Follow these steps exactly. The `table_job_*` MCP tools own all bookkeeping (row
 
    **If your harness can only run subagents as a blocking parallel batch** (all results return together), follow the same procedure treating the batch's return as all of its completions arriving at once: call `table_job_status`, top back up to `min(pending, 5)`, repeat. That degrades to wave-at-a-time dispatch — slower, but equally correct.
 
-6. Report to the user: the job table name, the `done` count, and the `failed` count. If any tasks failed, mention that their rows carry the failure reason in the `_task_error` column of the job table.
+6. Report to the user: the job table name, the `done` count, and the `failed` count. If any tasks failed, mention that their rows carry the failure reason in the `_task_error` column of the job table (which can also be inspected directly via the [Table Inspector](sidecar://table/inspector/)).
 
 **Rules:** never read or enumerate the source rows yourself — only `table_job_status` counts decide when you are finished. Never call `table_job_claim` yourself to check progress — a claim consumes a real task; `table_job_status` is the only progress signal. Do not stop early because workers "seem" done; the job is done only when `complete` is true — and only `pending`, never `claimed`, feeds the spawn count.
