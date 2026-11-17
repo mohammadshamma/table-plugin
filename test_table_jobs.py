@@ -16,12 +16,21 @@ guarantee: every task ends done or failed, none are lost.
 Run with: uv run test_table_jobs.py
 """
 
+import asyncio
+import os
+from pathlib import Path
 import random
+import shutil
 import sqlite3
+import subprocess
 import threading
 import unittest
 
+ORIGINAL_ENV = dict(os.environ)
+UV_BIN = shutil.which("uv") or "uv"
+
 import server
+from process_table_workflow import run_table_job_workflow
 from test_session_scoping import SessionScopingTestBase
 
 BOOKKEEPING_COLUMNS = {
@@ -1228,6 +1237,493 @@ class TestDropDeregistersCaseInsensitively(TableJobsTestBase):
             res = self.call_tool_sync("table_drop", {"table": name})
             self.assertIn("cannot drop the job registry", res.get("error", ""), res)
         self.assertEqual(self.status()["total"], 1)
+
+
+class TestProcessTableWorkflow(TableJobsTestBase):
+    """
+    Integration tests for run_table_job_workflow against server.dispatch and MCP wrappers.
+    Tests job draining, hybrid one-shot creation, bounded concurrency,
+    failure isolation with retries up to max_attempts, max_claims_per_worker enforcement,
+    and empty source tables.
+    """
+
+    def test_workflow_precreated_job_draining(self):
+        conv_id = "wf_drain_test"
+        db_path = self.brain_dir / conv_id / ".tables" / "session.db"
+        rows = [{"name": f"item_{i}", "score": i * 10} for i in range(8)]
+        self.call_tool_sync("table_create", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "columns": {"name": "TEXT", "score": "INTEGER"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "rows": rows,
+        })
+        self.call_tool_sync("table_job_create", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "template": "Analyze {name} with score {score}",
+            "job_table": "items_job",
+            "max_claims_per_worker": 1,
+        })
+
+        res = asyncio.run(run_table_job_workflow(
+            job_table="items_job",
+            conversation_id=conv_id,
+            call_tool_fn=server.dispatch,
+            agent_fn=lambda p: f"Answer: {p}",
+        ))
+
+        self.assertTrue(res["complete"])
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["total"], 8)
+        self.assertEqual(res["done"], 8)
+        self.assertEqual(res["failed"], 0)
+
+        conn = self.db_conn(db_path)
+        try:
+            job_rows = conn.execute("SELECT * FROM items_job").fetchall()
+            self.assertEqual(len(job_rows), 8)
+            worker_ids = set()
+            for r in job_rows:
+                self.assertEqual(r["_task_status"], "done")
+                self.assertTrue(r["result"].startswith("Answer: Analyze item_"))
+                self.assertIsNotNone(r["_task_claimed_by"])
+                worker_ids.add(r["_task_claimed_by"])
+            self.assertEqual(len(worker_ids), 8)
+            for wid in worker_ids:
+                self.assertTrue(wid.startswith(f"{conv_id}_wf_"))
+        finally:
+            conn.close()
+
+    def test_workflow_hybrid_oneshot_creation(self):
+        conv_id = "wf_oneshot_test"
+        db_path = self.brain_dir / conv_id / ".tables" / "session.db"
+        rows = [{"name": f"item_{i}", "score": i} for i in range(5)]
+        self.call_tool_sync("table_create", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "columns": {"name": "TEXT", "score": "INTEGER"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "rows": rows,
+        })
+
+        res = asyncio.run(run_table_job_workflow(
+            table="items",
+            template="Item: {name}",
+            job_table="items_oneshot_job",
+            conversation_id=conv_id,
+            call_tool_fn=server.dispatch,
+            agent_fn=lambda p: {"finish": f"Processed {p}"},
+        ))
+
+        self.assertTrue(res["complete"])
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["total"], 5)
+        self.assertEqual(res["done"], 5)
+        self.assertEqual(res["failed"], 0)
+
+        conn = self.db_conn(db_path)
+        try:
+            job_rows = conn.execute("SELECT * FROM items_oneshot_job").fetchall()
+            self.assertEqual(len(job_rows), 5)
+            for r in job_rows:
+                self.assertEqual(r["_task_status"], "done")
+                self.assertTrue(r["result"].startswith("Processed Item: item_"))
+        finally:
+            conn.close()
+
+    def test_workflow_bounded_concurrency(self):
+        conv_id = "wf_concurrency_test"
+        rows = [{"name": f"item_{i}", "score": i} for i in range(12)]
+        self.call_tool_sync("table_create", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "columns": {"name": "TEXT", "score": "INTEGER"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "rows": rows,
+        })
+
+        current_active = 0
+        max_active = 0
+        lock = asyncio.Lock()
+
+        async def concurrent_agent(prompt):
+            nonlocal current_active, max_active
+            async with lock:
+                current_active += 1
+                if current_active > max_active:
+                    max_active = current_active
+            await asyncio.sleep(0.02)
+            async with lock:
+                current_active -= 1
+            return f"Done: {prompt}"
+
+        res = asyncio.run(run_table_job_workflow(
+            table="items",
+            template="Process {name}",
+            concurrency=3,
+            conversation_id=conv_id,
+            call_tool_fn=server.dispatch,
+            agent_fn=concurrent_agent,
+        ))
+
+        self.assertTrue(res["complete"])
+        self.assertEqual(res["done"], 12)
+        self.assertLessEqual(max_active, 3)
+
+    def test_workflow_failure_isolation_and_retries(self):
+        conv_id = "wf_retry_test"
+        db_path = self.brain_dir / conv_id / ".tables" / "session.db"
+        rows = [
+            {"name": "ok_1", "score": 1},
+            {"name": "flaky", "score": 2},
+            {"name": "failing", "score": 3},
+            {"name": "ok_2", "score": 4},
+        ]
+        self.call_tool_sync("table_create", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "columns": {"name": "TEXT", "score": "INTEGER"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "rows": rows,
+        })
+
+        attempts = {}
+
+        def faulty_agent(prompt):
+            if "flaky" in prompt:
+                attempts["flaky"] = attempts.get("flaky", 0) + 1
+                if attempts["flaky"] == 1:
+                    raise RuntimeError("Transient network timeout")
+                return "Flaky recovered"
+            elif "failing" in prompt:
+                attempts["failing"] = attempts.get("failing", 0) + 1
+                raise RuntimeError("Permanent failure")
+            return f"Success: {prompt}"
+
+        res = asyncio.run(run_table_job_workflow(
+            table="items",
+            template="Task {name}",
+            job_table="items_retry_job",
+            max_attempts=3,
+            conversation_id=conv_id,
+            call_tool_fn=server.dispatch,
+            agent_fn=faulty_agent,
+        ))
+
+        self.assertTrue(res["complete"])
+        self.assertFalse(res["ok"])  # 1 failure
+        self.assertEqual(res["total"], 4)
+        self.assertEqual(res["done"], 3)
+        self.assertEqual(res["failed"], 1)
+
+        conn = self.db_conn(db_path)
+        try:
+            flaky_row = conn.execute("SELECT * FROM items_retry_job WHERE name = 'flaky'").fetchone()
+            self.assertEqual(flaky_row["_task_status"], "done")
+            self.assertEqual(flaky_row["result"], "Flaky recovered")
+            self.assertEqual(flaky_row["_task_attempts"], 2)
+
+            failing_row = conn.execute("SELECT * FROM items_retry_job WHERE name = 'failing'").fetchone()
+            self.assertEqual(failing_row["_task_status"], "failed")
+            self.assertIn("Permanent failure", failing_row["_task_error"])
+            self.assertEqual(failing_row["_task_attempts"], 3)
+
+            ok1_row = conn.execute("SELECT * FROM items_retry_job WHERE name = 'ok_1'").fetchone()
+            self.assertEqual(ok1_row["_task_status"], "done")
+            self.assertEqual(ok1_row["_task_attempts"], 1)
+        finally:
+            conn.close()
+
+    def test_workflow_max_claims_per_worker_enforcement(self):
+        conv_id = "wf_cap_test"
+        db_path = self.brain_dir / conv_id / ".tables" / "session.db"
+        rows = [{"name": f"item_{i}", "score": i} for i in range(6)]
+        self.call_tool_sync("table_create", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "columns": {"name": "TEXT", "score": "INTEGER"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "rows": rows,
+        })
+
+        res = asyncio.run(run_table_job_workflow(
+            table="items",
+            template="Work {name}",
+            job_table="items_cap_job",
+            max_claims_per_worker=1,
+            conversation_id=conv_id,
+            call_tool_fn=server.dispatch,
+        ))
+
+        self.assertTrue(res["complete"])
+        self.assertEqual(res["done"], 6)
+
+        conn = self.db_conn(db_path)
+        try:
+            job_rows = conn.execute("SELECT _task_claimed_by FROM items_cap_job").fetchall()
+            workers = [r["_task_claimed_by"] for r in job_rows]
+            self.assertEqual(len(set(workers)), 6)
+
+            # Verifies that calling table_job_claim with any of these worker IDs is rejected
+            for wid in workers:
+                claim_res = server.dispatch("table_job_claim", {
+                    "job_table": "items_cap_job",
+                    "conversation_id": wid,
+                })
+                self.assertIsNone(claim_res["task"])
+                self.assertIn("worker claim limit reached", claim_res["reason"])
+        finally:
+            conn.close()
+
+    def test_workflow_call_tool_mcp_result_wrapper(self):
+        conv_id = "wf_mcp_wrapper_test"
+        rows = [{"name": f"item_{i}", "score": i} for i in range(3)]
+        self.call_tool_sync("table_create", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "columns": {"name": "TEXT", "score": "INTEGER"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "rows": rows,
+        })
+
+        async def mcp_call_tool(name: str, args: dict):
+            params = server.types.CallToolRequestParams(name=name, arguments=args)
+            return await server.call_tool(None, params)
+
+        res = asyncio.run(run_table_job_workflow(
+            table="items",
+            template="MCP: {name}",
+            conversation_id=conv_id,
+            call_tool_fn=mcp_call_tool,
+        ))
+
+        self.assertTrue(res["complete"])
+        self.assertEqual(res["done"], 3)
+
+    def test_workflow_empty_source_table(self):
+        conv_id = "wf_empty_test"
+        self.call_tool_sync("table_create", {
+            "conversation_id": conv_id,
+            "table": "empty_items",
+            "columns": {"name": "TEXT"},
+        })
+
+        res = asyncio.run(run_table_job_workflow(
+            table="empty_items",
+            template="Do {name}",
+            conversation_id=conv_id,
+            call_tool_fn=server.dispatch,
+        ))
+
+        self.assertTrue(res["complete"])
+        self.assertEqual(res["total"], 0)
+        self.assertEqual(res["done"], 0)
+        self.assertEqual(res["failed"], 0)
+
+    def test_workflow_cli_help_smoke(self):
+        """Verify uv run process_table_workflow.py --help succeeds cleanly with exit code 0."""
+        res = subprocess.run(
+            [UV_BIN, "run", "process_table_workflow.py", "--help"],
+            cwd=str(Path(__file__).resolve().parent),
+            env=ORIGINAL_ENV,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(res.returncode, 0, f"CLI help failed: {res.stderr}")
+        self.assertIn("Deterministic table workflow runner", res.stdout)
+
+    def test_workflow_prelude_script_execution(self):
+        """Verify process_table_workflow.py runs inside Antigravity's <prelude> AST/event-loop runner."""
+        import ast
+        import inspect
+        import sys
+        import json
+
+        conv_id = "wf_prelude_test"
+        self.call_tool_sync("table_create", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "columns": {"name": "TEXT"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "rows": [{"name": "alpha"}, {"name": "beta"}, {"name": "gamma"}],
+        })
+
+        script_path = Path(__file__).resolve().parent / "process_table_workflow.py"
+        script_src = script_path.read_text(encoding="utf-8")
+        tree = ast.parse(script_src, "<workflow>")
+        trailing = None
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            trailing = compile(
+                ast.Expression(tree.body.pop().value),
+                "<workflow>",
+                "eval",
+                flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT,
+            )
+        code = compile(tree, "<workflow>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+
+        # Emulate <prelude>'s _eval inside a synthetic "<prelude>" frame
+        prelude_ns: dict = {"inspect": inspect, "eval": eval}
+        exec(
+            compile(
+                "async def _eval(code, scope):\n"
+                "    value = eval(code, scope)\n"
+                "    if code.co_flags & inspect.CO_COROUTINE:\n"
+                "        value = await value\n"
+                "    return value\n",
+                "<prelude>",
+                "exec",
+            ),
+            prelude_ns,
+        )
+
+        async def fake_call_tool(name: str, **kwargs):
+            tool_name = name.removeprefix("mcp_table_table_").removeprefix("mcp_table_")
+            return json.dumps(server.dispatch(tool_name, kwargs))
+
+        async def fake_agent(prompt: str, schema=None, role=None, type_name="self", workspace="inherit", model=None):
+            return f"Agent({role}): {prompt}"
+
+        scope = {
+            "args": {
+                "table": "items",
+                "template": "Summarize {name}",
+                "job_table": "items_prelude_job",
+                "max_workers": 2,
+            },
+            "CONVERSATION_ID": conv_id,
+            "call_tool": fake_call_tool,
+            "agent": fake_agent,
+            "log": lambda *a: None,
+            "phase": lambda n: n,
+        }
+
+        async def run_like_prelude():
+            await prelude_ns["_eval"](code, scope)
+            if trailing is not None:
+                return await prelude_ns["_eval"](trailing, scope)
+            return None
+
+        out = asyncio.run(run_like_prelude())
+        self.assertIsInstance(out, dict)
+        self.assertTrue(out["complete"])
+        self.assertEqual(out["done"], 3)
+        self.assertEqual(out["failed"], 0)
+
+    def test_workflow_prelude_without_call_tool_and_stdlib_server_import(self):
+        """Verify process_table_workflow.py runs in <prelude> when call_tool is absent and mcp is unavailable."""
+        import ast
+        import inspect
+        import sys
+
+        # 1. Verify server.py imports cleanly in a subprocess where mcp & anyio are blocked
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; sys.modules['mcp'] = None; sys.modules['mcp.types'] = None; "
+                    "sys.modules['anyio'] = None; import server; "
+                    "assert server._HAS_MCP is False; assert callable(server.dispatch)"
+                ),
+            ],
+            cwd=str(Path(__file__).resolve().parent),
+            env=ORIGINAL_ENV,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(probe.returncode, 0, f"Stdlib server import failed: {probe.stderr}")
+
+        # 2. Verify <prelude> execution without call_tool in globals() falls back to server.dispatch
+        conv_id = "wf_prelude_no_call_tool"
+        self.call_tool_sync("table_create", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "columns": {"name": "TEXT"},
+        })
+        self.call_tool_sync("table_insert", {
+            "conversation_id": conv_id,
+            "table": "items",
+            "rows": [{"name": "one"}, {"name": "two"}],
+        })
+
+        script_path = Path(__file__).resolve().parent / "process_table_workflow.py"
+        script_src = script_path.read_text(encoding="utf-8")
+        tree = ast.parse(script_src, "<workflow>")
+        trailing = None
+        if tree.body and isinstance(tree.body[-1], ast.Expr):
+            trailing = compile(
+                ast.Expression(tree.body.pop().value),
+                "<workflow>",
+                "eval",
+                flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT,
+            )
+        code = compile(tree, "<workflow>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+
+        prelude_ns: dict = {"inspect": inspect, "eval": eval}
+        exec(
+            compile(
+                "async def _eval(code, scope):\n"
+                "    value = eval(code, scope)\n"
+                "    if code.co_flags & inspect.CO_COROUTINE:\n"
+                "        value = await value\n"
+                "    return value\n",
+                "<prelude>",
+                "exec",
+            ),
+            prelude_ns,
+        )
+
+        async def fake_agent(prompt: str, schema=None, role=None, type_name="self", workspace="inherit", model=None):
+            return f"Direct({role}): {prompt}"
+
+        scope = {
+            "args": {
+                "table": "items",
+                "template": "Describe {name}",
+                "job_table": "items_direct_job",
+                "concurrency": 2,
+            },
+            "CONVERSATION_ID": conv_id,
+            "agent": fake_agent,
+            "log": lambda *a: None,
+            "phase": lambda n: n,
+        }
+
+        async def run_like_prelude():
+            await prelude_ns["_eval"](code, scope)
+            if trailing is not None:
+                return await prelude_ns["_eval"](trailing, scope)
+            return None
+
+        out = asyncio.run(run_like_prelude())
+        self.assertIsInstance(out, dict)
+        self.assertTrue(out["complete"])
+        self.assertEqual(out["done"], 2)
+        self.assertEqual(out["failed"], 0)
 
 
 if __name__ == "__main__":

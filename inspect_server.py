@@ -288,61 +288,63 @@ STYLE = """
   color-scheme: light dark;
   --bg: var(--background, var(--vscode-editor-background, #ffffff));
   --fg: var(--foreground, var(--vscode-editor-foreground, #1f2328));
-  --fg-muted: var(--muted, var(--vscode-descriptionForeground, #656d76));
-  --link: var(--link-color, var(--vscode-textLink-foreground, #0969da));
+  --fg-muted: var(--muted-foreground, var(--secondary-foreground, var(--vscode-descriptionForeground, #656d76)));
+  --link: var(--link-color, var(--primary, var(--vscode-textLink-foreground, #0969da)));
   --border: var(--border-color, var(--vscode-panel-border, #d0d7de));
-  --th-bg: var(--table-header-bg, var(--vscode-editorGroupHeader-tabsBackground, #f6f8fa));
-  --card-bg: var(--card-background, var(--vscode-sideBar-background, #f6f8fa));
-  --pre-bg: var(--code-background, var(--vscode-textCodeBlock-background, #f6f8fa));
-  --pill-bg: var(--pill-background, #eaeef2);
+  --th-bg: var(--table-header-bg, var(--muted, var(--vscode-editorGroupHeader-tabsBackground, #f6f8fa)));
+  --card-bg: var(--card-background, var(--card, var(--vscode-sideBar-background, #f6f8fa)));
+  --pre-bg: var(--code-background, var(--muted, var(--vscode-textCodeBlock-background, #f6f8fa)));
+  --pill-bg: var(--pill-background, var(--secondary, #eaeef2));
   --pill-hover-bg: var(--pill-hover-background, #dbe2e8);
-  --pill-active-bg: var(--accent, var(--vscode-button-background, #0969da));
-  --pill-active-fg: var(--accent-foreground, var(--vscode-button-foreground, #ffffff));
+  --pill-active-bg: var(--accent, var(--primary, var(--vscode-button-background, #0969da)));
+  --pill-active-fg: var(--accent-foreground, var(--primary-foreground, var(--vscode-button-foreground, #ffffff)));
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: var(--background, var(--vscode-editor-background, #0d1117));
     --fg: var(--foreground, var(--vscode-editor-foreground, #e6edf3));
-    --fg-muted: var(--muted, var(--vscode-descriptionForeground, #848d97));
-    --link: var(--link-color, var(--vscode-textLink-foreground, #4493f8));
+    --fg-muted: var(--muted-foreground, var(--secondary-foreground, var(--vscode-descriptionForeground, #848d97)));
+    --link: var(--link-color, var(--primary, var(--vscode-textLink-foreground, #4493f8)));
     --border: var(--border-color, var(--vscode-panel-border, #30363d));
-    --th-bg: var(--table-header-bg, var(--vscode-editorGroupHeader-tabsBackground, #161b22));
-    --card-bg: var(--card-background, var(--vscode-sideBar-background, #161b22));
-    --pre-bg: var(--code-background, var(--vscode-textCodeBlock-background, #161b22));
-    --pill-bg: var(--pill-background, #21262d);
+    --th-bg: var(--table-header-bg, var(--muted, var(--vscode-editorGroupHeader-tabsBackground, #161b22)));
+    --card-bg: var(--card-background, var(--card, var(--vscode-sideBar-background, #161b22)));
+    --pre-bg: var(--code-background, var(--muted, var(--vscode-textCodeBlock-background, #161b22)));
+    --pill-bg: var(--pill-background, var(--secondary, #21262d));
     --pill-hover-bg: var(--pill-hover-background, #30363d);
-    --pill-active-bg: var(--accent, var(--vscode-button-background, #1f6feb));
-    --pill-active-fg: var(--accent-foreground, var(--vscode-button-foreground, #ffffff));
+    --pill-active-bg: var(--accent, var(--primary, var(--vscode-button-background, #1f6feb)));
+    --pill-active-fg: var(--accent-foreground, var(--primary-foreground, var(--vscode-button-foreground, #ffffff)));
   }
 }
 
 :root[data-theme="light"] {
+  color-scheme: light;
   --bg: var(--background, #ffffff);
   --fg: var(--foreground, #1f2328);
-  --fg-muted: var(--muted, #656d76);
-  --link: var(--link-color, #0969da);
+  --fg-muted: var(--muted-foreground, var(--secondary-foreground, #656d76));
+  --link: var(--link-color, var(--primary, #0969da));
   --border: var(--border-color, #d0d7de);
-  --th-bg: var(--table-header-bg, #f6f8fa);
-  --card-bg: var(--card-background, #f6f8fa);
-  --pre-bg: var(--code-background, #f6f8fa);
-  --pill-bg: var(--pill-background, #eaeef2);
-  --pill-active-bg: var(--accent, #0969da);
-  --pill-active-fg: #ffffff;
+  --th-bg: var(--table-header-bg, var(--muted, #f6f8fa));
+  --card-bg: var(--card-background, var(--card, #f6f8fa));
+  --pre-bg: var(--code-background, var(--muted, #f6f8fa));
+  --pill-bg: var(--pill-background, var(--secondary, #eaeef2));
+  --pill-active-bg: var(--accent, var(--primary, #0969da));
+  --pill-active-fg: var(--accent-foreground, var(--primary-foreground, #ffffff));
 }
 
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --bg: var(--background, #0d1117);
   --fg: var(--foreground, #e6edf3);
-  --fg-muted: var(--muted, #848d97);
-  --link: var(--link-color, #4493f8);
+  --fg-muted: var(--muted-foreground, var(--secondary-foreground, #848d97));
+  --link: var(--link-color, var(--primary, #4493f8));
   --border: var(--border-color, #30363d);
-  --th-bg: var(--table-header-bg, #161b22);
-  --card-bg: var(--card-background, #161b22);
-  --pre-bg: var(--code-background, #161b22);
-  --pill-bg: var(--pill-background, #21262d);
-  --pill-active-bg: var(--accent, #1f6feb);
-  --pill-active-fg: #ffffff;
+  --th-bg: var(--table-header-bg, var(--muted, #161b22));
+  --card-bg: var(--card-background, var(--card, #161b22));
+  --pre-bg: var(--code-background, var(--muted, #161b22));
+  --pill-bg: var(--pill-background, var(--secondary, #21262d));
+  --pill-active-bg: var(--accent, var(--primary, #1f6feb));
+  --pill-active-fg: var(--accent-foreground, var(--primary-foreground, #ffffff));
 }
 
 * { box-sizing: border-box; }
@@ -472,22 +474,53 @@ pre.err { background: #dc262618; border-color: #dc262644; }
 
 THEME_SCRIPT = """
 (() => {
-  window.addEventListener('message', (event) => {
-    if (event.data && (event.data.type === 'theme-change' || event.data.event === 'theme-change')) {
-      const payload = event.data.payload || event.data;
-      const vars = payload.cssVariables || payload.variables || {};
+  const STORAGE_KEY = 'table_inspector_theme';
+  function inferThemeFromBg() {
+    if (!document.documentElement) return null;
+    const probe = document.createElement('span');
+    probe.style.cssText = 'position:absolute;visibility:hidden;color:var(--background, #ffffff)';
+    document.documentElement.appendChild(probe);
+    const c = getComputedStyle(probe).color || '';
+    probe.remove();
+    const nums = (c.match(/[\\d.]+/g) || []).map(Number);
+    if (nums.length < 3) return null;
+    const scale = c.startsWith('color(') ? 1 : 255;
+    const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
+    const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    return lum < 0.5 ? 'dark' : 'light';
+  }
+  function applyTheme(vars, explicitTheme) {
+    if (vars && typeof vars === 'object') {
       for (const [key, val] of Object.entries(vars)) {
         if (typeof key === 'string' && key.startsWith('--')) {
           document.documentElement.style.setProperty(key, val);
         }
       }
-      const theme = payload.theme || event.data.theme;
-      if (theme) {
-        document.documentElement.setAttribute('data-theme', theme);
-        if (theme === 'dark' || theme === 'light') {
-          document.documentElement.style.colorScheme = theme;
-        }
+    }
+    const theme = explicitTheme || inferThemeFromBg();
+    if (theme) {
+      document.documentElement.setAttribute('data-theme', theme);
+      if (theme === 'dark' || theme === 'light') {
+        document.documentElement.style.colorScheme = theme;
       }
+    }
+  }
+  try {
+    const cached = sessionStorage.getItem(STORAGE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      applyTheme(parsed.vars, parsed.theme);
+    }
+  } catch (e) {}
+  window.addEventListener('message', (event) => {
+    if (event.data && (event.data.type === 'theme-change' || event.data.event === 'theme-change')) {
+      const payload = event.data.payload || event.data;
+      const vars = payload.cssVariables || payload.variables || {};
+      const explicitTheme = payload.theme || event.data.theme || null;
+      applyTheme(vars, explicitTheme);
+      try {
+        sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ vars, theme: explicitTheme }));
+      } catch (e) {}
     }
   });
 })();
@@ -540,11 +573,11 @@ def page(
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<meta name='color-scheme' content='light dark'>"
         f"{meta_tag}"
-        f"<title>{html.escape(title)}</title><style>{STYLE}</style></head><body>"
+        f"<title>{html.escape(title)}</title><style>{STYLE}</style>{theme_script}</head><body>"
         f'<main id="main">{switcher}{crumb_html}{body}</main>'
         '<div class="note">Read-only inspector. Status reflects the last agent '
         "activity; expired leases requeue on the next agent action.</div>"
-        f"{live}{theme_script}</body></html>"
+        f"{live}</body></html>"
     )
 
 

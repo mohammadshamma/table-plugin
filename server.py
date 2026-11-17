@@ -28,11 +28,28 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import table_tool
 
-import anyio
-import mcp.types as types
-from mcp.server import ServerRequestContext
-from mcp.server.lowlevel import Server
-from mcp.server.stdio import stdio_server
+try:
+    import anyio
+    import mcp.types as types
+    from mcp.server import ServerRequestContext
+    from mcp.server.lowlevel import Server
+    from mcp.server.stdio import stdio_server
+    _HAS_MCP = True
+except ImportError:
+    from types import SimpleNamespace
+    anyio = None  # type: ignore[assignment]
+    ServerRequestContext = object  # type: ignore[assignment,misc]
+    Server = None  # type: ignore[assignment,misc]
+    stdio_server = None  # type: ignore[assignment]
+    types = SimpleNamespace(  # type: ignore[assignment]
+        Tool=lambda **kw: SimpleNamespace(**kw),
+        PaginatedRequestParams=object,
+        ListToolsResult=lambda **kw: SimpleNamespace(**kw),
+        CallToolRequestParams=lambda **kw: SimpleNamespace(**kw),
+        CallToolResult=lambda **kw: SimpleNamespace(**kw),
+        TextContent=lambda **kw: SimpleNamespace(**kw),
+    )
+    _HAS_MCP = False
 
 
 # Lineage helpers are hosted in table_tool.py so stdlib-only consumers like
@@ -44,6 +61,7 @@ get_brain_dir = table_tool.get_brain_dir
 get_scratch_dir = table_tool.get_scratch_dir
 find_parent_conversation = table_tool.find_parent_conversation
 find_root_conversation = table_tool.find_root_conversation
+WORKER_CONV_ID_RE = table_tool.WORKER_CONV_ID_RE
 
 
 # ─── Build identity ──────────────────────────────────────────────────────────
@@ -994,11 +1012,15 @@ async def call_tool(
     )
 
 
-server = Server(
-    "table",
-    version=PLUGIN_VERSION,
-    on_list_tools=list_tools,
-    on_call_tool=call_tool,
+server = (
+    Server(
+        "table",
+        version=PLUGIN_VERSION,
+        on_list_tools=list_tools,
+        on_call_tool=call_tool,
+    )
+    if _HAS_MCP
+    else None
 )
 
 

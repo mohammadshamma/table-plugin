@@ -834,6 +834,7 @@ class QueueGuard:
 
 LINEAGE_CACHE: dict[str, str] = {}
 LINEAGE_CACHE_LOCK = threading.Lock()
+WORKER_CONV_ID_RE = re.compile(r"^([a-zA-Z0-9_-]+)_wf_(\d+)$")
 
 
 def get_brain_dir() -> Path:
@@ -852,11 +853,24 @@ def find_parent_conversation(
     """
     Scans the directories in brain_dir for transcript.jsonl logs.
     Identifies if a parent conversation has invoked the given child_id.
+    Recognizes synthetic workflow worker IDs (<parent_id>_wf_<digits>)
+    and resolves them directly to <parent_id> without scanning transcripts.
     """
-    if not child_id or not brain_dir.is_dir():
+    if not child_id:
         return None
 
     skip = {child_id} if exclude is None else (exclude | {child_id})
+
+    # Synthetic workflow worker ID fast path: <parent_id>_wf_<digits>
+    m = WORKER_CONV_ID_RE.match(child_id)
+    if m:
+        parent_candidate = m.group(1)
+        if parent_candidate not in skip:
+            return parent_candidate
+        return None
+
+    if not brain_dir.is_dir():
+        return None
 
     # Check for exact conversation ID boundary (valid chars: alphanumeric, underscore, hyphen)
     def matches_boundary(target_id: str, text: str) -> bool:

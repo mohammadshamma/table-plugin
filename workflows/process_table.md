@@ -1,10 +1,10 @@
 ---
-description: Process every row of a database table with parallel subagents — templated LLM task per row, results in a job table, guaranteed no row is missed.
+description: Process every row of a database table via deterministic workflow runner (or parallel subagents) — templated LLM task per row, results in a job table, guaranteed no row is missed.
 ---
 
-# Process a table's rows with subagents
+# Process a table's rows
 
-Follow these steps exactly. The `table_job_*` MCP tools own all bookkeeping (row enumeration, prompt templating, assignment, retries); your only job is to pump workers until the server reports the job complete.
+Follow these steps exactly. The `table_job_*` MCP tools own all bookkeeping (row enumeration, prompt templating, assignment, retries); the workflow runner handles execution until the server reports the job complete.
 
 **Permissions:** under the default review policy, each worker's `table_job_claim`/`table_job_submit` call triggers a permission prompt. Advise the user to relax the review policy before starting (IDE: Settings → Antigravity → Advanced Settings → Review policy → "Agent Decides"/"Always Proceed"; CLI: a `/permissions` preset, or `agy --dangerously-skip-permissions` for headless runs) — per-tool `"alwaysAllow"` in `mcp_config.json` is [currently ignored by Antigravity](https://discuss.ai.google.dev/t/how-to-auto-approve-specific-local-mcp-tools-bypass-accept-prompt-in-antigravity/135984). A relaxed policy auto-approves **all** agent actions, so they should restore their usual setting once the job completes.
 
@@ -17,13 +17,17 @@ Follow these steps exactly. The `table_job_*` MCP tools own all bookkeeping (row
 
 2. Read your conversationId from your User Information/Metadata and pass it as `conversation_id` in every table tool call in this workflow.
 
-3. Call `table_job_create` with the source `table`, `template`, and `job_table`. Leave `max_claims_per_worker` at its default (1) — the claim-once worker frame in step 5 depends on it. Report the `total_tasks` count to the user, and surface a link to the [Table Inspector](sidecar://table/inspector/) (proactively once per conversation) so the user can watch the queue drain and monitor per-task progress live in the auxiliary pane.
+3. Call `table_job_create` with the source `table`, `template`, and `job_table`. Leave `max_claims_per_worker` at its default (1). Report the `total_tasks` count to the user, and surface a link to the [Table Inspector](sidecar://table/inspector/) (proactively once per conversation) so the user can watch the queue drain and monitor per-task progress live in the auxiliary pane.
 
-4. Call `table_job_status` for the job table.
-   - If `complete` is true, go to step 6.
-   - Otherwise dispatch `min(pending, 5)` workers as described in step 5.
+4. **Execute per-row processing**:
 
-5. Dispatch each worker as its **own background (asynchronous) subagent**, so that each worker's result comes back to you individually as it finishes — do not launch them as one blocking "run these N in parallel" batch if your harness offers a non-blocking form. Assemble each worker's prompt from the three-part frame below: the opening and closing are verbatim (substitute only the job table name); the execution slot in the middle is yours to fill.
+   **Primary path — Dispatch via `run_workflow`**:
+   If the `run_workflow` tool is available in your environment, dispatch `process_table_workflow.py` (located in the plugin root alongside `server.py`, e.g. `~/.gemini/config/plugins/table/process_table_workflow.py`):
+   - Call `run_workflow(ScriptPath="<plugin_dir>/process_table_workflow.py", Description="Process table job <JOB_TABLE>", Args={"job_table": "<JOB_TABLE>", "conversation_id": "<CONVERSATION_ID>", "concurrency": 5})` (or pass `table` and `template` in `Args` for hybrid one-shot creation).
+   - The runner executes a bounded `asyncio` worker pool, stamping workers with `<conversation_id>_wf_<seq>`, calling a fresh single-use `agent()` per row, catching errors and retrying up to `max_attempts` (default 3), and submitting results via MCP until complete.
+
+   **Fallback path — Manual subagent pump (`invoke_subagent`)**:
+   If `run_workflow` is unavailable, call `table_job_status`. If `complete` is true, go to step 5. Otherwise, top up a rolling pool of ~5 fresh one-task subagents using the verbatim three-part frame below:
 
    **Opening (verbatim):**
 
@@ -39,15 +43,8 @@ Follow these steps exactly. The `table_job_*` MCP tools own all bookkeeping (row
 
    > Call `table_job_submit` with the task_id and your answer as `result` (or, if you cannot complete it, the reason as `error`), exactly once. Then stop. Do not call `table_job_claim` again and do not look for more work: you are a one-task worker, and the remaining rows belong to fresh workers.
 
-   **Why the frame is fixed:** one task per worker means every row is processed in a fresh context. A worker that loops back to claim again drags all previous rows' work along in its context, degrading each successive answer (context rot). The server enforces this too — by default a job refuses a second claim from the same worker. Never rewrite the frame into a loop.
+   **Replenishment — keep ~5 workers in flight:** track the number of workers in flight yourself: +1 when you dispatch one, −1 when its result returns to you. Whenever one or more worker results arrive, call `table_job_status` once and dispatch `min(pending, 5 − in_flight)` fresh workers until `complete` is true.
 
-   **Replenishment — keep ~5 workers in flight:** track the number of workers in flight yourself: +1 when you dispatch one, −1 when its result returns to you. Whenever one or more worker results arrive, call `table_job_status` once and then:
-   - If `complete` is true, go to step 6.
-   - If `pending > 0`, dispatch `min(pending, 5 − in_flight)` **fresh** worker subagents, each built from the full three-part frame. A replacement is always a brand-new subagent — never send a finished worker back to claim again, and never tell one worker to process multiple rows; "keep 5 in flight" means five concurrent one-task workers.
-   - If `pending` is 0 but `complete` is false, every remaining task is claimed. Dispatch nothing. If workers are still in flight, wait for their results. If none are in flight, the claims belong to dead workers whose leases (default 600s) have not yet expired — wait, then call `table_job_status` again (the status call itself requeues expired leases) and dispatch from the new `pending` count. Never spawn "just in case" against claimed tasks.
-
-   **If your harness can only run subagents as a blocking parallel batch** (all results return together), follow the same procedure treating the batch's return as all of its completions arriving at once: call `table_job_status`, top back up to `min(pending, 5)`, repeat. That degrades to wave-at-a-time dispatch — slower, but equally correct.
-
-6. Report to the user: the job table name, the `done` count, and the `failed` count. If any tasks failed, mention that their rows carry the failure reason in the `_task_error` column of the job table (which can also be inspected directly via the [Table Inspector](sidecar://table/inspector/)).
+5. Report to the user: the job table name, the `done` count, and the `failed` count. If any tasks failed, mention that their rows carry the failure reason in the `_task_error` column of the job table (which can also be inspected directly via the [Table Inspector](sidecar://table/inspector/)).
 
 **Rules:** never read or enumerate the source rows yourself — only `table_job_status` counts decide when you are finished. Never call `table_job_claim` yourself to check progress — a claim consumes a real task; `table_job_status` is the only progress signal. Do not stop early because workers "seem" done; the job is done only when `complete` is true — and only `pending`, never `claimed`, feeds the spawn count.

@@ -1656,5 +1656,175 @@ class TestVersionTool(SessionScopingTestBase):
             self.assertEqual(server.git_revision(), {})
 
 
+class TestWorkflowWorkerScoping(SessionScopingTestBase):
+    """
+    Unit tests for synthetic workflow worker IDs (<parent_id>_wf_<digits>).
+    Verifies direct parent resolution, recursive root resolution across subagent
+    hierarchies, caching, and database isolation/sharing.
+    """
+
+    def test_worker_direct_parent_resolution_without_transcripts(self):
+        """Worker ID resolves to parent without any transcript files on disk."""
+        self.assertEqual(
+            server.find_parent_conversation("my-session_wf_0", self.brain_dir),
+            "my-session",
+        )
+        self.assertEqual(
+            server.find_parent_conversation("my-session_wf_42", self.brain_dir),
+            "my-session",
+        )
+        self.assertEqual(
+            server.find_parent_conversation("conv_123_wf_9999", self.brain_dir),
+            "conv_123",
+        )
+
+    def test_worker_direct_parent_resolution_empty_or_nonexistent_brain(self):
+        """Worker ID resolves even if brain_dir does not exist or has no session directories."""
+        nonexistent = self.brain_dir / "does_not_exist"
+        self.assertEqual(
+            server.find_parent_conversation("parent-sess_wf_1", nonexistent),
+            "parent-sess",
+        )
+
+    def test_worker_recursive_root_resolution_single_tier(self):
+        """Worker resolves recursively to parent when parent is the root session."""
+        self.assertEqual(
+            server.find_root_conversation("root-sess_wf_1", self.brain_dir),
+            "root-sess",
+        )
+        expected_db = str(self.brain_dir / "root-sess" / ".tables" / "session.db")
+        self.assertEqual(
+            server.get_resolved_db_path({"conversation_id": "root-sess_wf_1"}),
+            expected_db,
+        )
+
+    def test_worker_recursive_subagent_hierarchy(self):
+        """Worker in subagent (root -> subagent -> worker) resolves to root conversation."""
+        self.write_mock_transcript("root-session", "subagent-1")
+
+        # find_parent_conversation returns subagent-1
+        self.assertEqual(
+            server.find_parent_conversation("subagent-1_wf_0", self.brain_dir),
+            "subagent-1",
+        )
+        # find_root_conversation returns root-session
+        self.assertEqual(
+            server.find_root_conversation("subagent-1_wf_0", self.brain_dir),
+            "root-session",
+        )
+        # get_resolved_db_path returns root-session's database
+        expected_db = str(self.brain_dir / "root-session" / ".tables" / "session.db")
+        self.assertEqual(
+            server.get_resolved_db_path({"conversation_id": "subagent-1_wf_0"}),
+            expected_db,
+        )
+
+    def test_worker_recursive_deep_subagent_hierarchy(self):
+        """Worker in multi-tier hierarchy (grandparent -> parent -> child -> worker)."""
+        self.write_mock_transcript("grandparent", "parent")
+        self.write_mock_transcript("parent", "child")
+
+        self.assertEqual(
+            server.find_root_conversation("child_wf_15", self.brain_dir),
+            "grandparent",
+        )
+        expected_db = str(self.brain_dir / "grandparent" / ".tables" / "session.db")
+        self.assertEqual(
+            server.get_resolved_db_path({"conversation_id": "child_wf_15"}),
+            expected_db,
+        )
+
+    def test_worker_nested_worker_ids(self):
+        """Chained worker IDs (e.g. root_wf_1_wf_2) peel off layers to root."""
+        self.assertEqual(
+            server.find_parent_conversation("root_wf_1_wf_2", self.brain_dir),
+            "root_wf_1",
+        )
+        self.assertEqual(
+            server.find_root_conversation("root_wf_1_wf_2", self.brain_dir),
+            "root",
+        )
+        expected_db = str(self.brain_dir / "root" / ".tables" / "session.db")
+        self.assertEqual(
+            server.get_resolved_db_path({"conversation_id": "root_wf_1_wf_2"}),
+            expected_db,
+        )
+
+    def test_worker_lineage_cache_population(self):
+        """Resolving worker ID populates LINEAGE_CACHE for subsequent O(1) lookups."""
+        conv_id = "cache-root_wf_7"
+        with server.LINEAGE_CACHE_LOCK:
+            server.LINEAGE_CACHE.clear()
+
+        server.get_resolved_db_path({"conversation_id": conv_id})
+        with server.LINEAGE_CACHE_LOCK:
+            self.assertEqual(server.LINEAGE_CACHE.get(conv_id), "cache-root")
+
+    def test_worker_near_misses_do_not_resolve_synthetically(self):
+        """Near-miss conversation IDs without valid _wf_<digits> do not match."""
+        # Near-misses fall back to transcript scanning and return None if no transcript exists
+        self.assertIsNone(server.find_parent_conversation("parent_wf_", self.brain_dir))
+        self.assertIsNone(server.find_parent_conversation("parent_wf_abc", self.brain_dir))
+        self.assertIsNone(server.find_parent_conversation("parent_wf_-1", self.brain_dir))
+        self.assertIsNone(server.find_parent_conversation("_wf_1", self.brain_dir))
+        self.assertIsNone(server.find_parent_conversation("wf_1", self.brain_dir))
+
+    def test_worker_loop_guard(self):
+        """If parent candidate is in skip set, return None to guard against loop."""
+        self.assertIsNone(
+            server.find_parent_conversation("parent_wf_1", self.brain_dir, exclude={"parent"})
+        )
+
+    def test_worker_environment_variable_scoping(self):
+        """ANTIGRAVITY_CONVERSATION_ID with worker ID routes to parent's database."""
+        os.environ["ANTIGRAVITY_CONVERSATION_ID"] = "env-root_wf_3"
+        expected_db = str(self.brain_dir / "env-root" / ".tables" / "session.db")
+        self.assertEqual(
+            server.get_resolved_db_path({}),
+            expected_db,
+        )
+
+    def test_worker_end_to_end_shares_database_with_parent_and_siblings(self):
+        """Parent creates table and row; workers query and insert rows into the same DB."""
+        # Parent creates table and seeds row
+        res = self.call_tool_sync("table_create", {
+            "conversation_id": "main-job-sess",
+            "table": "work_items",
+            "columns": {"id": "INTEGER", "payload": "TEXT"},
+        })
+        self.assertTrue(res.get("ok"))
+        self.call_tool_sync("table_insert", {
+            "conversation_id": "main-job-sess",
+            "table": "work_items",
+            "rows": [{"id": 1, "payload": "item 1"}],
+        })
+
+        # Worker 0 reads parent's row and inserts worker row
+        read_res = self.call_tool_sync("table_run_sql", {
+            "conversation_id": "main-job-sess_wf_0",
+            "sql": "SELECT payload FROM work_items WHERE id = 1",
+        })
+        self.assertEqual(read_res["rows"][0]["payload"], "item 1")
+
+        self.call_tool_sync("table_insert", {
+            "conversation_id": "main-job-sess_wf_0",
+            "table": "work_items",
+            "rows": [{"id": 2, "payload": "worker 0 output"}],
+        })
+
+        # Sibling Worker 1 verifies both rows
+        count_res = self.call_tool_sync("table_run_sql", {
+            "conversation_id": "main-job-sess_wf_1",
+            "sql": "SELECT COUNT(*) as n FROM work_items",
+        })
+        self.assertEqual(count_res["rows"][0]["n"], 2)
+
+        # Database exists strictly under main-job-sess/.tables/session.db
+        main_db = self.brain_dir / "main-job-sess" / ".tables" / "session.db"
+        self.assertTrue(main_db.is_file())
+        self.assertFalse((self.brain_dir / "main-job-sess_wf_0").exists())
+        self.assertFalse((self.brain_dir / "main-job-sess_wf_1").exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

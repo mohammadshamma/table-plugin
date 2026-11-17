@@ -75,12 +75,14 @@ Antigravity agents will automatically use the table tools to execute these opera
 ## Job processing: run a task over every row
 
 The `table_job_*` tools are a **durable work queue** that runs a templated LLM
-task over **every row** of a table using parallel subagents, without trusting
-the model to enumerate rows. `table_job_create` copies each source row into a
-*job table* as a `pending` task (pure SQL, so nothing is missed); worker
-subagents then pump `table_job_claim` → `table_job_submit`, and the
-orchestrating agent keeps a rolling pool of ~5 single-task workers topped up —
-checking `table_job_status` as each finishes — until `complete`.
+task over **every row** of a table using parallel workers, without trusting
+the model to enumerate rows.
+
+Instead of burdening the main conversation with manual replenishment and queue polling, Antigravity dispatches the deterministic Python workflow runner `process_table_workflow.py` via `run_workflow`. The runner manages a bounded `asyncio` worker pool (default 5 concurrent workers) that claims tasks and delegates each row to a fresh single-use `agent()` with synthetic worker IDs `<parent_id>_wf_<digits>`.
+
+`table_tool.py` instantly resolves `<parent_id>_wf_<digits>` to the parent session database without scanning transcript logs, enabling high-throughput worker isolation without disk thrashing. The runner also supports hybrid one-shot mode (passing `table` + `template` automatically creates the job table before draining).
+
+When `run_workflow` is unavailable, manual subagent orchestration (`invoke_subagent`) is fully supported as a fallback: `table_job_create` copies each source row into a *job table* as a `pending` task (pure SQL, so nothing is missed); worker subagents then pump `table_job_claim` → `table_job_submit`, and the orchestrating agent keeps a rolling pool of ~5 single-task workers topped up — checking `table_job_status` as each finishes — until `complete`.
 
 The queue is built so that LLM nondeterminism can cost retries, but never rows:
 
@@ -166,9 +168,13 @@ cp workflows/inspect.md /path/to/your/project/.agent/workflows/
 ```
 Antigravity Host ──► MCP Server (server.py) ───────► table_tool.py ──► Session Database
   (stdio, uv run)    14 tools                        imported module   (.tables/session.db)
-                                                               ▲
-Auxiliary Pane   ──► Sidecar (inspect_server.py) ───────────┘
-  (sidecar://)       HTTP, stdlib-only, per-request scoping
+                            ▲                               ▲
+Auxiliary Pane   ───────────┼──► Sidecar (inspect_server.py)┘
+  (sidecar://)              │    HTTP, stdlib-only, per-request scoping
+                            │
+Workflow Runner  ───────────┘
+  (process_table_workflow.py)
+  run_workflow / asyncio pool
 ```
 
 `server.py` is a single-file [PEP 723](https://peps.python.org/pep-0723/)
@@ -176,6 +182,11 @@ script: `uv run` reads its inline metadata, provisions Python and the pinned
 `mcp` SDK, and starts the server. Tool calls dispatch directly to functions
 imported from `table_tool.py` — no subprocess per call. `table_tool.py` also
 hosts lineage resolution helpers and remains usable standalone as a CLI.
+
+`process_table_workflow.py` is a deterministic workflow runner script deployed
+at the plugin root. It coordinates task draining using an `asyncio` worker pool,
+stamping worker claims with `<parent_id>_wf_<seq>` IDs that resolve directly
+to the parent conversation's SQLite database.
 
 `inspect_server.py` is a stdlib-only HTTP server running as an Antigravity
 sidecar (`table/inspector`), configured in `sidecars/inspector/sidecar.json`

@@ -982,9 +982,17 @@ class InspectSwitcherBarAndThemeTest(unittest.TestCase):
         self.assertIn("setProperty", script)
         self.assertIn("data-theme", script)
         self.assertIn("colorScheme", script)
+        self.assertIn("sessionStorage", script)
 
         status, htm = inspect_server.render_index(self.conn)
         self.assertIn(script, htm)
+        self.assertLess(htm.index(script), htm.index("</head><body>"))
+
+    def test_fg_muted_uses_muted_foreground_not_surface_muted(self):
+        style = inspect_server.STYLE
+        self.assertIn("--fg-muted: var(--muted-foreground", style)
+        self.assertNotIn("--fg-muted: var(--muted,", style)
+        self.assertIn(':root:not([data-theme="light"])', style)
 
     def test_compact_aux_pane_styling(self):
         style = inspect_server.STYLE

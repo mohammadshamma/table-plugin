@@ -34,13 +34,23 @@ Use `table_import_csv` whenever the user has a CSV file to get into a table. The
 - The response includes the inferred `columns` and `inserted` count — report these to the user; no follow-up `table_schema` call needed. Proactively include a link to the [Table Inspector](sidecar://table/inspector/) in your response (once per conversation) so the user can browse the imported table.
 - If the table already exists the tool errors; ask the user before `table_drop` + retry — never drop silently.
 
-## Processing Every Row with Subagents (table_job_* tools)
+## Processing Every Row (table_job_* tools)
 
-Use the `table_job_*` tools when a table's rows each need an LLM task performed (summarize, classify, extract, ...). The server owns all bookkeeping — row enumeration, prompt templating, assignment, retries — so no row can be missed, even across thousands of rows. Your only job is to pump workers until the server says the job is complete.
+Use the `table_job_*` tools when a table's rows each need an LLM task performed (summarize, classify, extract, ...). The server owns all bookkeeping — row enumeration, prompt templating, assignment, retries — so no row can be missed, even across thousands of rows.
 
 > Tip: if a `/process_table` workflow is installed, invoke it instead of improvising this recipe.
 
-### Orchestrating (main agent)
+### Primary: Deterministic Python Workflow (`run_workflow`)
+
+When your harness exposes the `run_workflow` tool, dispatch the bundled workflow runner `process_table_workflow.py` (located alongside `server.py` in the plugin root, e.g. `~/.gemini/config/plugins/table/process_table_workflow.py`):
+
+- **Execution**: Call `run_workflow(ScriptPath="<plugin_dir>/process_table_workflow.py", Description="Process table job <JOB_TABLE>", Args={"job_table": "<JOB_TABLE>", "conversation_id": "<CONVERSATION_ID>", "concurrency": 5})`. It manages a bounded `asyncio` worker pool (default 5 concurrent workers), claims tasks with synthetic worker IDs `<parent_id>_wf_<seq>` (automatically resolved to the parent session database), dispatches a single-use row `agent()` per claimed row, isolates errors and retries up to `max_attempts` (default 3), and submits completed results to the queue.
+- **Modes**: Supports both pre-created jobs (passing `job_table` in `Args`) and hybrid one-shot execution (passing `table` and `template` in `Args` to create the job table automatically).
+- **Monitoring**: Proactively surface a link to the [Table Inspector](sidecar://table/inspector/) (once per conversation) so the user can watch the queue drain live in the auxiliary pane.
+
+### Fallback: Manual Subagent Orchestration (`invoke_subagent`)
+
+When `run_workflow` is unavailable, orchestrate manually using `invoke_subagent`:
 
 1. Call `table_job_create` with the source `table`, a `template` containing `{column}` placeholders (e.g. `"Summarize this review: {review_text}"`), and a `job_table` name. The job table is a snapshot copy of the source rows plus a `result` column and task bookkeeping. Proactively include a link to the [Table Inspector](sidecar://table/inspector/) in your response (once per conversation) so the user can monitor job progress in the auxiliary pane.
 2. Call `table_job_status`. If `complete` is true, stop and report the `done` and `failed` counts.

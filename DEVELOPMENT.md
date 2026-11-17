@@ -19,8 +19,8 @@ inside a real Antigravity session.
 ### Run the tests
 
 ```bash
-uv run test_session_scoping.py         # server + session-scoped DB routing
-uv run test_table_jobs.py              # table_job_* work-queue semantics
+uv run test_session_scoping.py         # server + session-scoped DB routing + worker ID lineage
+uv run test_table_jobs.py              # table_job_* work-queue semantics + workflow runner
 uv run test_csv_import.py              # CSV type inference + import wiring
 uv run test_inspect.py                 # sidecar config, scoping, auth, UI & theme rendering
 python3 -m unittest test_table_tool -v # table_tool CLI (pure stdlib)
@@ -184,12 +184,11 @@ To reproduce the session routing outside Antigravity, export
 ## Before you ship
 
 - Run all five test suites (above).
-- Tool JSON schemas in `server.py` are frozen — treat any schema change as a
+- Tool JSON schemas in `server.py` are frozen (14 schemas byte-identical) — treat any schema change as a
   breaking change.
 - If you changed tool behavior or schemas, update `skills/table/SKILL.md`
   and the relevant `workflows/*.md` recipe to match; every user-initiated
   operation gets a workflow recipe.
-- Keep `inspect_server.py` at the repo root next to `server.py` — it is
-  invoked by `sidecars/inspector/sidecar.json` (`../../inspect_server.py`) and
-  imports `table_tool`.
+- Keep `inspect_server.py` and `process_table_workflow.py` at the repo root next to `server.py` — they are
+  deployed directly alongside `table_tool.py`.
 - Bump `version` in `plugin.json` and `PLUGIN_VERSION` in `server.py`.
